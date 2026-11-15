@@ -386,9 +386,9 @@ class CodeGenerator80186:
             if dst == "(HL)":
                 if src.startswith("0x"):
                     imm = src.replace("0x", "0") + "h"
-                    return ["mov si, cx", f"mov byte [si], {imm}"]
+                    return ["push ax", f"mov al, {imm}", "mov si, cx", "call helper_write_hl", "pop ax"]
                 xsrc = REG8_TO_X86.get(src, 'al')
-                return ["mov si, cx", f"mov [si], {xsrc}"]
+                return ["push ax", f"mov al, {xsrc}", "mov si, cx", "call helper_write_hl", "pop ax"]
             # LD r, (HL)
             if src == "(HL)":
                 xdst = REG8_TO_X86.get(dst, 'al')
@@ -491,7 +491,7 @@ class CodeGenerator80186:
         if m == "LD (DE), A":
             return ["call helper_write_de"]
         if m == "LD A, (DE)":
-            return ["mov bp, dx", "mov al, [bp]"]
+            return ["mov bp, dx", "mov al, [ds:bp]"]
 
         # LDI / LDD
         if m == "LDI (HL), A":
@@ -602,8 +602,15 @@ class CodeGenerator80186:
             elif r == "(HL)":
                 return ["mov si, cx", f"and byte [si], {mask}"]
 
+        if m.startswith("SWAP "):
+            r = m.split()[1]
+            if r in REG8_TO_X86:
+                xr = REG8_TO_X86[r]
+                return [f"rol {xr}, 4", f"test {xr}, {xr}"]
+            elif r == "(HL)":
+                return ["mov si, cx", "rol byte [si], 4", "test byte [si], 0FFh"]
+
         cb_rotates = {
-            "SWAP": "rol {r}, 4",
             "SLA":  "shl {r}, 1",
             "SRA":  "sar {r}, 1",
             "SRL":  "shr {r}, 1",
@@ -639,7 +646,7 @@ class CodeGenerator80186:
             parts = m[3:].split(", ")
             if len(parts) == 1:
                 if parts[0] == "(HL)":
-                    return ["mov si, cx", "call helper_dispatch_jp_hl"]
+                    return ["mov si, cx", "jmp near helper_dispatch_jp_hl"]
                 target = int(parts[0], 16)
                 self.labels.add((bank, target))
                 return [f"jmp near {self.label_name(bank, target)}"]

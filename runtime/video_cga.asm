@@ -386,10 +386,12 @@ dmg_cga_nibble_table:
 
 ; ------------------------------------------------------------------------------
 ; helper_update_bgp: Update 256-byte DMG-to-CGA nibble lookup table
-; AL = new BGP palette register value
+; AL = new BGP palette register value. Preserves all registers and CPU flags!
 ; ------------------------------------------------------------------------------
 global helper_update_bgp
 helper_update_bgp:
+    pushf
+    push    ax
     push    bx
     push    cx
     push    dx
@@ -428,6 +430,12 @@ helper_update_bgp:
     mov     ch, dl
     shr     ch, cl
     and     ch, 03h
+    push    bx
+    mov     bl, ch
+    xor     bh, bh
+    mov     ch, [cs:cfg_shade0 + bx]
+    pop     bx
+    and     ch, 03h
     shl     ch, 6
     or      dh, ch
     pop     cx
@@ -447,6 +455,12 @@ helper_update_bgp:
     shl     cl, 1
     mov     ch, dl
     shr     ch, cl
+    and     ch, 03h
+    push    bx
+    mov     bl, ch
+    xor     bh, bh
+    mov     ch, [cs:cfg_shade0 + bx]
+    pop     bx
     and     ch, 03h
     shl     ch, 4
     or      dh, ch
@@ -468,6 +482,12 @@ helper_update_bgp:
     mov     ch, dl
     shr     ch, cl
     and     ch, 03h
+    push    bx
+    mov     bl, ch
+    xor     bh, bh
+    mov     ch, [cs:cfg_shade0 + bx]
+    pop     bx
+    and     ch, 03h
     shl     ch, 2
     or      dh, ch
     pop     cx
@@ -488,6 +508,12 @@ helper_update_bgp:
     mov     ch, dl
     shr     ch, cl
     and     ch, 03h
+    push    bx
+    mov     bl, ch
+    xor     bh, bh
+    mov     ch, [cs:cfg_shade0 + bx]
+    pop     bx
+    and     ch, 03h
     or      dh, ch
     pop     cx
 
@@ -503,14 +529,17 @@ helper_update_bgp:
     pop     dx
     pop     cx
     pop     bx
+    pop     ax
+    popf
     ret
 
 ; ------------------------------------------------------------------------------
-; cga_render_gb_frame: Render Game Boy VRAM (0x8000..0x9FFF) to CGA Mode 04h VRAM
-; Uses LCDC (0xFF40), SCY (0xFF42), SCX (0xFF43), and precomputed nibble table.
+; cga_render_gb_frame: Render Game Boy VRAM (0x8000..0x9FFF) & OAM to CGA Mode 04h
+; Uses LCDC (0xFF40), SCY (0xFF42), SCX (0xFF43), BGP (0xFF47), and OAM (0xFE00).
 ; ------------------------------------------------------------------------------
 global cga_render_gb_frame
 cga_render_gb_frame:
+    pushf
     push    ax
     push    bx
     push    cx
@@ -524,6 +553,11 @@ cga_render_gb_frame:
     mov     al, [ds:0FF40h]
     test    al, 80h             ; Bit 7: LCD enable
     jz      near .render_done   ; LCD disabled, skip
+
+    ; Ensure BGP nibble table is up to date with [ds:0FF47h]
+    mov     al, [ds:0FF47h]
+    call    helper_update_bgp
+    mov     al, [ds:0FF40h]
 
     ; Setup ES = CGA VRAM segment
     mov     bx, CGA_VRAM_SEG
@@ -556,6 +590,24 @@ cga_render_gb_frame:
     xor     cx, cx              ; CX = screen line Y (0..143)
 .line_loop:
     push    cx
+
+    ; Check if STAT LYC split-scroll applies to this scanline (Y <= LYC)
+    mov     al, [ds:0FF42h]
+    mov     ah, [ds:0FF43h]
+    test    byte [ds:0FFFFh], 02h
+    jz      .use_main_scroll
+    mov     bl, [ds:0FF45h]
+    cmp     bl, 0
+    je      .use_main_scroll
+    cmp     bl, 144
+    jae     .use_main_scroll
+    cmp     cl, bl
+    ja      .use_main_scroll
+    mov     al, [cs:hud_scy]
+    mov     ah, [cs:hud_scx]
+.use_main_scroll:
+    mov     [cs:render_scy], al
+    mov     [cs:render_scx], ah
 
     ; Calculate VRAM destination pointer for line Y
     mov     bx, cx
@@ -649,7 +701,178 @@ cga_render_gb_frame:
     pop     cx
     inc     cx
     cmp     cx, GB_SCREEN_HEIGHT
-    jb      .line_loop
+    jb      near .line_loop
+
+    ; --------------------------------------------------------------------------
+    ; Render OAM Sprites (0xFE00..0xFE9F, 40 sprites) if LCDC bit 1 is enabled
+    ; --------------------------------------------------------------------------
+    mov     al, [ds:0FF40h]
+    test    al, 02h
+    jz      near .render_done
+
+    mov     byte [cs:render_spr_h], 8
+    test    al, 04h             ; Bit 2: 8x16 sprites
+    jz      .spr_h_ok
+    mov     byte [cs:render_spr_h], 16
+.spr_h_ok:
+
+    mov     si, 0FE9Ch          ; Render from sprite 39 down to 0 so lower index has priority
+    mov     cx, 40
+.spr_loop:
+    push    cx
+    push    si
+
+    mov     al, [ds:si]         ; Y + 16
+    cmp     al, 0
+    je      near .spr_next
+    cmp     al, 160
+    jae     near .spr_next
+    sub     al, 16
+    mov     [cs:render_spr_y], al
+
+    mov     al, [ds:si+1]       ; X + 8
+    cmp     al, 0
+    je      near .spr_next
+    cmp     al, 168
+    jae     near .spr_next
+    sub     al, 8
+    mov     [cs:render_spr_x], al
+
+    mov     al, [ds:si+2]       ; Tile index
+    cmp     byte [cs:render_spr_h], 16
+    jne     .spr_tile_ok
+    and     al, 0FEh
+.spr_tile_ok:
+    mov     [cs:render_spr_tile], al
+
+    mov     al, [ds:si+3]       ; Attributes
+    mov     [cs:render_spr_attr], al
+
+    ; Palette: bit 4 selects OBP0 (0xFF48) or OBP1 (0xFF49)
+    mov     dl, [ds:0FF48h]
+    test    al, 10h
+    jz      .spr_pal_ok
+    mov     dl, [ds:0FF49h]
+.spr_pal_ok:
+    mov     [cs:render_spr_pal], dl
+
+    xor      cx, cx             ; CX = row 0 .. spr_h-1
+.spr_row_loop:
+    mov     al, [cs:render_spr_y]
+    add     al, cl              ; screen_y = spr_y + row
+    cmp     al, 144
+    jae     near .spr_row_next  ; unsigned >= 144 also catches negative wrap!
+
+    ; Calculate CGA scanline pointer for screen_y
+    xor     bx, bx
+    mov     bl, al
+    shl     bx, 1
+    mov     bp, [cs:cga_scanline_offsets + bx]
+
+    ; Effective row (handle Y-flip bit 6)
+    mov     al, cl
+    test    byte [cs:render_spr_attr], 40h
+    jz      .no_yflip
+    mov     al, [cs:render_spr_h]
+    dec     al
+    sub     al, cl
+.no_yflip:
+    xor     ah, ah
+    shl     ax, 1               ; eff_row * 2
+    mov     bx, ax
+
+    mov     al, [cs:render_spr_tile]
+    xor     ah, ah
+    shl     ax, 4               ; tile * 16
+    add     ax, 08000h
+    add     bx, ax              ; BX = GB VRAM tile row address
+
+    mov     al, [ds:bx]         ; B0
+    mov     ah, [ds:bx+1]       ; B1
+
+    ; Loop 8 horizontal pixels (ch = 0..7)
+    xor     ch, ch
+.spr_px_loop:
+    mov     dl, [cs:render_spr_x]
+    add     dl, ch              ; screen_x = spr_x + px
+    cmp     dl, 160
+    jae     .spr_px_next
+
+    ; Bit position in tile plane (handle X-flip bit 5)
+    push    cx
+    mov     cl, ch
+    test    byte [cs:render_spr_attr], 20h
+    jnz     .xflip_ok
+    mov     cl, 7
+    sub     cl, ch
+.xflip_ok:
+    mov     dh, 1
+    shl     dh, cl              ; DH = bit mask for pixel
+
+    xor     bl, bl
+    test    ah, dh
+    jz      .sp_b1_0
+    or      bl, 02h
+.sp_b1_0:
+    test    al, dh
+    jz      .sp_b0_0
+    or      bl, 01h
+.sp_b0_0:
+    pop     cx
+    or      bl, bl              ; Color 0 is transparent!
+    jz      .spr_px_next
+
+    ; Map color 1..3 through OBP palette and cfg_shade0..3
+    push    ax
+    push    cx
+    mov     cl, bl
+    shl     cl, 1
+    mov     al, [cs:render_spr_pal]
+    shr     al, cl
+    and     al, 03h
+    xor     bh, bh
+    mov     bl, al
+    mov     al, [cs:cfg_shade0 + bx]
+    and     al, 03h             ; AL = 2-bit CGA pixel shade (0..3)
+
+    ; Write 2-bit pixel into ES:[bp + (screen_x >> 2)]
+    xor     bh, bh
+    mov     bl, dl
+    shr     bl, 2               ; byte offset 0..39
+    mov     di, bp
+    add     di, bx
+
+    mov     cl, dl
+    and     cl, 03h
+    xor     cl, 03h             ; (3 - (screen_x & 3))
+    shl     cl, 1               ; shift = 6, 4, 2, 0
+
+    mov     ah, 03h
+    shl     ah, cl
+    not     ah                  ; clear mask
+    shl     al, cl              ; shifted pixel bits
+
+    and     [es:di], ah
+    or      [es:di], al
+    pop     cx
+    pop     ax
+
+.spr_px_next:
+    inc     ch
+    cmp     ch, 8
+    jb      .spr_px_loop
+
+.spr_row_next:
+    inc     cl
+    cmp     cl, [cs:render_spr_h]
+    jb      near .spr_row_loop
+
+.spr_next:
+    pop     si
+    pop     cx
+    sub     si, 4
+    dec     cx
+    jnz     near .spr_loop
 
 .render_done:
     pop     es
@@ -660,6 +883,7 @@ cga_render_gb_frame:
     pop     cx
     pop     bx
     pop     ax
+    popf
     ret
 
 ; Rendering scratch variables in CS
@@ -669,3 +893,13 @@ render_fine_y:          db 0
 render_unsigned_tile:   db 1
 render_scy:             db 0
 render_scx:             db 0
+global hud_scy
+hud_scy:                db 0
+global hud_scx
+hud_scx:                db 0
+render_spr_h:           db 8
+render_spr_y:           db 0
+render_spr_x:           db 0
+render_spr_tile:        db 0
+render_spr_attr:        db 0
+render_spr_pal:         db 0

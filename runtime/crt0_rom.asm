@@ -11,10 +11,10 @@ cpu 186
 %include "runtime/video_cga.inc"
 
 %ifndef SEG1_PARAS_VAL
-    %define SEG1_PARAS_VAL 0
-    %define SEG2_PARAS_VAL 0
-    %define SEG3_PARAS_VAL 0
-    %define SEG_ROM_PARAS_VAL 0
+    %define SEG1_PARAS_VAL 01111h
+    %define SEG2_PARAS_VAL 02222h
+    %define SEG3_PARAS_VAL 03333h
+    %define SEG_ROM_PARAS_VAL 04444h
 %endif
 
 ; ------------------------------------------------------------------------------
@@ -258,8 +258,8 @@ hook_int09:
 
 unhook_int09:
     push    ds
-    mov     dx, [old_int09_off]
-    mov     ds, [old_int09_seg]
+    mov     dx, [cs:old_int09_off]
+    mov     ds, [cs:old_int09_seg]
     mov     ax, 2509h
     int     21h
     pop     ds

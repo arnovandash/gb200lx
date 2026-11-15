@@ -17,6 +17,227 @@ from codegen_80186.recompiler_80186 import SM83Disassembler, CodeGenerator80186
 OUT_DIR = "build/rom"
 BUILD_DIR = "build"
 
+
+def detect_rst_table_dispatchers(disasm: SM83Disassembler) -> Tuple[Set[int], Set[int]]:
+    """
+    Detect RST vectors in Bank 0 (0x00, 0x08, ..., 0x38) that implement an inline
+    jump-table dispatcher (popping the caller return address via POP HL/DE/BC and
+    tail-jumping via JP (HL)).
+    Returns (rst_table_vecs, pop_ret_jp_hl_addrs).
+    """
+    rst_vecs: Set[int] = set()
+    pop_jp_hl_addrs: Set[int] = set()
+    for vec in [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38]:
+        cur = vec
+        saw_pop = False
+        for _ in range(16):
+            ins = disasm.decode_instr(0, cur)
+            m = ins.mnemonic
+            # The return-address POP must occur within the first 8 bytes of the RST vector
+            if m in ("POP HL", "POP DE", "POP BC") and cur < vec + 8:
+                saw_pop = True
+            if m == "JP (HL)" and saw_pop:
+                rst_vecs.add(vec)
+                pop_jp_hl_addrs.add(cur)
+                break
+            if ins.is_unconditional_jump or m in ("RET", "RETI", "NOP"):
+                break
+            cur += max(1, ins.length)
+    return rst_vecs, pop_jp_hl_addrs
+
+
+def read_inline_jump_table(disasm: SM83Disassembler, bank: int, table_addr: int) -> List[int]:
+    """
+    Read a contiguous array of 16-bit Game Boy target pointers starting at table_addr.
+    Stops when reaching the lowest target in the same bank after table_addr, or invalid code.
+    """
+    limit = 0x4000 if bank == 0 else 0x8000
+    cur = table_addr
+    targets: List[int] = []
+    while cur < limit and len(targets) < 128:
+        w = disasm.read_u16(bank, cur)
+        if w < 0x0150 or w >= 0x8000:
+            break
+        if table_addr < w < limit and ((bank == 0 and w < 0x4000) or (bank > 0 and w >= 0x4000)):
+            limit = w
+        targets.append(w)
+        cur += 2
+    return targets
+
+
+def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int]):
+    """
+    Perform validated control-flow and jump-table discovery across all banks.
+    Never pollutes code labels with interior operand bytes or graphics/level data.
+    """
+    bank_labels: Dict[int, Set[int]] = {b: set() for b in range(4)}
+    jp_hl_targets: Dict[int, Set[int]] = {b: set() for b in range(4)}
+    b0_to_bn_set: Set[int] = set()
+    bn_to_b0_set: Set[int] = set()
+
+    # 1. Trace Bank 0 from hardware entry vectors
+    b0_seeds = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x60, 0x100, 0x150, 0x3F92]
+    worklist: List[int] = list(b0_seeds)
+    for a in b0_seeds:
+        bank_labels[0].add(a)
+
+    b0_vis: Set[int] = set()
+    b0_interior: Set[int] = set()
+
+    while worklist:
+        addr = worklist.pop()
+        if addr in b0_vis or not (0 <= addr < 0x4000):
+            continue
+        b0_vis.add(addr)
+
+        ins = disasm.decode_instr(0, addr)
+        for k in range(1, ins.length):
+            b0_interior.add(addr + k)
+        m = ins.mnemonic
+
+        if m.startswith("RST "):
+            vec = int(m[4:], 16)
+            if vec in rst_table_vecs:
+                tbl_targets = read_inline_jump_table(disasm, 0, addr + ins.length)
+                for t in tbl_targets:
+                    jp_hl_targets[0].add(t)
+                    if t < 0x4000:
+                        bank_labels[0].add(t)
+                        worklist.append(t)
+                    elif t < 0x8000:
+                        b0_to_bn_set.add(t)
+                continue
+
+        if m == "JP (HL)":
+            continue
+
+        if ins.target_addr is not None:
+            t = ins.target_addr
+            if t < 0x4000:
+                bank_labels[0].add(t)
+                worklist.append(t)
+            elif t < 0x8000:
+                b0_to_bn_set.add(t)
+
+        if not ins.is_unconditional_jump and m not in ("RET", "RETI"):
+            worklist.append(addr + ins.length)
+
+    # Remove any seed that turned out to be an interior operand byte of a real instruction
+    bank_labels[0] -= b0_interior
+
+    # 2. Helper to validate and trace a candidate function entry in Bank 1..3
+    def trace_bank_subgraph(b: int, start_t: int):
+        wl = [start_t]
+        vis: Set[int] = set()
+        interior: Set[int] = set()
+        labels: Set[int] = {start_t}
+        b0_refs: Set[int] = set()
+        tbl_addrs: Set[int] = set()
+
+        while wl:
+            a = wl.pop()
+            if a in vis:
+                continue
+            if not (0x4000 <= a < 0x8000):
+                return None
+            vis.add(a)
+            ins = disasm.decode_instr(b, a)
+            m = ins.mnemonic
+            if m.startswith("DB ") or m == "STOP" or m.startswith("RST ") or m.startswith("LD SP"):
+                return None
+            for k in range(1, ins.length):
+                interior.add(a + k)
+
+            if m == "JP (HL)":
+                if disasm.read_u8(b, a - 3) == 0xCD and disasm.read_u8(b, a - 6) == 0x21:
+                    tbl = disasm.read_u16(b, a - 5)
+                    if 0x4000 <= tbl < 0x8000:
+                        tbl_addrs.add(tbl)
+                continue
+
+            if ins.target_addr is not None:
+                t = ins.target_addr
+                if t < 0x4000:
+                    if t in b0_interior or t < 0x0150:
+                        return None
+                    b0_refs.add(t)
+                elif t < 0x8000:
+                    labels.add(t)
+                    wl.append(t)
+                else:
+                    return None
+
+            if not ins.is_unconditional_jump and m not in ("RET", "RETI"):
+                wl.append(a + ins.length)
+
+        if (labels & interior) or (vis & interior):
+            return None
+        return vis, interior, labels, b0_refs, tbl_addrs
+
+    # 3. Trace Banks 1..3 from validated cross-bank entry points
+    for b in [1, 2, 3]:
+        b_interior: Set[int] = set()
+        pending_tables: Set[int] = set()
+        for t in sorted(b0_to_bn_set):
+            bank_labels[b].add(t)
+            res = trace_bank_subgraph(b, t)
+            if res is not None:
+                vis, interior, labels, b0_refs, tbl_addrs = res
+                b_interior |= interior
+                bank_labels[b] |= labels
+                pending_tables |= tbl_addrs
+                for r in b0_refs:
+                    bn_to_b0_set.add(r)
+                    bank_labels[0].add(r)
+
+        # Also trace validated JP (HL) table entries in Bank b transitively
+        seen_tables: Set[int] = set()
+        while pending_tables:
+            tbl = min(pending_tables)
+            pending_tables.remove(tbl)
+            if tbl in seen_tables:
+                continue
+            seen_tables.add(tbl)
+            for i in range(32):
+                w = disasm.read_u16(b, tbl + i * 2)
+                if not (0x4000 <= w < 0x8000):
+                    break
+                res = trace_bank_subgraph(b, w)
+                if res is not None:
+                    vis, interior, labels, b0_refs, more_tbls = res
+                    b_interior |= interior
+                    bank_labels[b] |= labels
+                    jp_hl_targets[b].add(w)
+                    pending_tables |= (more_tbls - seen_tables)
+                    for r in b0_refs:
+                        bn_to_b0_set.add(r)
+                        bank_labels[0].add(r)
+                else:
+                    break
+
+        bank_labels[b] -= b_interior
+
+    # 4. Trace any newly discovered bn_to_b0 entry points in Bank 0
+    new_b0 = list(bn_to_b0_set - b0_vis)
+    while new_b0:
+        addr = new_b0.pop()
+        if addr in b0_vis or addr in b0_interior or not (0 <= addr < 0x4000):
+            continue
+        b0_vis.add(addr)
+        ins = disasm.decode_instr(0, addr)
+        for k in range(1, ins.length):
+            b0_interior.add(addr + k)
+        m = ins.mnemonic
+        if ins.target_addr is not None and ins.target_addr < 0x4000 and ins.target_addr not in b0_interior:
+            bank_labels[0].add(ins.target_addr)
+            new_b0.append(ins.target_addr)
+        if not ins.is_unconditional_jump and m not in ("RET", "RETI", "JP (HL)"):
+            new_b0.append(addr + ins.length)
+
+    bank_labels[0] -= b0_interior
+    return bank_labels, jp_hl_targets, b0_to_bn_set, bn_to_b0_set
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="GB200LX: Static Game Boy (DMG) to 16-Bit 80186 DOS Recompiler for HP 200LX"
@@ -27,7 +248,6 @@ def main():
 
     rom_path = args.rom
     if not rom_path:
-        # Look for a local .gb file in current directory or roms/ directory
         candidates = [f for f in os.listdir(".") if f.lower().endswith(".gb")]
         if not candidates and os.path.isdir("roms"):
             candidates = [os.path.join("roms", f) for f in os.listdir("roms") if f.lower().endswith(".gb")]
@@ -62,33 +282,48 @@ def main():
 
     disasm = SM83Disassembler(rom_bytes)
 
-    # 1. Identify Cross-Bank Entry Points
-    # Targets in 0x4000..0x7FFF called from Bank 0
-    b0_to_bn = sorted(list(set(
-        disasm.decode_instr(0, a).target_addr
-        for a in range(0, 0x4000)
-        if disasm.decode_instr(0, a).is_call and disasm.decode_instr(0, a).target_addr is not None and 0x4000 <= disasm.decode_instr(0, a).target_addr < 0x8000
-    )))
+    # 1. Detect inline RST jump-table dispatchers & run control-flow discovery
+    rst_table_vecs, pop_jp_hl_addrs = detect_rst_table_dispatchers(disasm)
+    print(f"[gb200lx] Detected inline jump-table RST vectors: {[hex(v) for v in sorted(rst_table_vecs)]}")
+
+    bank_labels, jp_hl_targets, b0_to_bn_set, bn_to_b0_set = discover_control_flow(disasm, rst_table_vecs)
+
+    b0_to_bn = sorted(list(b0_to_bn_set))
     b0_to_bn_idx = {t: i for i, t in enumerate(b0_to_bn)}
 
-    # Targets in 0x0000..0x3FFF called from Banks 1..3
-    bn_to_b0 = sorted(list(set(
-        disasm.decode_instr(b, a).target_addr
-        for b in [1, 2, 3]
-        for a in range(0x4000, 0x8000)
-        if disasm.decode_instr(b, a).is_call and disasm.decode_instr(b, a).target_addr is not None and disasm.decode_instr(b, a).target_addr < 0x4000
-    )))
+    bn_to_b0 = sorted(list(bn_to_b0_set))
     bn_to_b0_idx = {t: i for i, t in enumerate(bn_to_b0)}
 
-    print(f"[gb200lx] Cross-bank calls: Bank 0 -> Banks 1..3: {len(b0_to_bn)} targets")
-    print(f"[gb200lx] Cross-bank calls: Banks 1..3 -> Bank 0: {len(bn_to_b0)} targets")
+    print(f"[gb200lx] Cross-bank entry points: Bank 0 -> Banks 1..3: {len(b0_to_bn)} targets")
+    print(f"[gb200lx] Cross-bank entry points: Banks 1..3 -> Bank 0: {len(bn_to_b0)} targets")
+    for b in range(4):
+        print(f"[gb200lx] Bank {b} JP (HL) targets: {len(jp_hl_targets[b])}")
 
     # 2. Generate Bank Jump Tables & Dispatches
-    # Bank 0: Jump table at offset 4 (after jmp near entry + nop)
+    # Bank 0 layout starting at offset 4:
+    #   0004h..001Fh: 7 far-callable runtime helper bridges (7 * 4 = 28 bytes)
+    #   0020h..     : b0_entry_table (bn_to_b0 wrappers, 4 bytes each)
     disp_b0_lines = [
         "bits 16", "cpu 186", "",
-        "; Table of wrappers in Bank 0 called from Banks 1..3 (starts at offset 4)",
-        "align 4",
+        "; Fixed-offset far-callable runtime helper bridges at 0004h..001Ch",
+        "global b0_helper_table",
+        "b0_helper_table:",
+        "    call near helper_write_mbc",
+        "    retf",
+        "    call near helper_write_mmio",
+        "    retf",
+        "    call near helper_read_joyp",
+        "    retf",
+        "    call near helper_read_div",
+        "    retf",
+        "    call near helper_read_ly",
+        "    retf",
+        "    call near helper_update_bgp",
+        "    retf",
+        "    call near helper_halt",
+        "    retf",
+        "",
+        "; Table of wrappers in Bank 0 called from Banks 1..3 (starts at exact offset 0020h = 32)",
         "global b0_entry_table",
         "b0_entry_table:",
     ]
@@ -106,8 +341,21 @@ def main():
         "    add     sp, 4",
         "    ret",
         "",
-        "; Dispatchers for Bank 0 calling Banks 1..3"
+        "; Indirect jump dispatcher JP (HL) for Bank 0",
+        "global helper_dispatch_jp_hl",
+        "helper_dispatch_jp_hl:",
     ])
+    for t in sorted(jp_hl_targets[0]):
+        disp_b0_lines.append(f"    cmp cx, 0{t:04X}h")
+        if t < 0x4000:
+            disp_b0_lines.append(f"    je  near loc_00_{t:04x}")
+        else:
+            disp_b0_lines.append(f"    je  near dispatch_call_{t:04x}")
+    disp_b0_lines.append("    add di, 2")
+    disp_b0_lines.append("    ret")
+    disp_b0_lines.append("")
+    disp_b0_lines.append("; Dispatchers for Bank 0 calling Banks 1..3")
+
     for t in b0_to_bn:
         idx = b0_to_bn_idx[t]
         disp_b0_lines.append(f"global dispatch_call_{t:04x}")
@@ -130,11 +378,11 @@ def main():
     with open(f"{OUT_DIR}/dispatch_b0.asm", "w") as f:
         f.write("\n".join(disp_b0_lines) + "\n")
 
-    # Banks 1, 2, 3: Jump table at offset 0 (B0 -> BN entry points)
+    # Banks 1, 2, 3: Jump table at exact offset 0 (B0 -> BN entry points)
     for b in [1, 2, 3]:
         disp_bn_lines = [
-            "bits 16", "cpu 186", "org 0", "",
-            f"; Bank {b} Entry Jump Table (offset 0)",
+            "bits 16", "cpu 186", "",
+            f"; Bank {b} Entry Jump Table (starts at exact offset 0)",
             f"global b{b}_entry_table",
             f"b{b}_entry_table:",
         ]
@@ -142,28 +390,58 @@ def main():
             disp_bn_lines.append(f"    call near loc_{b:02x}_{t:04x}")
             disp_bn_lines.append("    retf")
 
-        disp_bn_lines.append("\n; Far call helpers for calling Bank 0")
+        disp_bn_lines.extend([
+            "",
+            f"; Indirect jump dispatcher JP (HL) for Bank {b}",
+            "global helper_dispatch_jp_hl",
+            "helper_dispatch_jp_hl:",
+        ])
+        for t in sorted(jp_hl_targets[b]):
+            disp_bn_lines.append(f"    cmp cx, 0{t:04X}h")
+            if t >= 0x4000:
+                disp_bn_lines.append(f"    je  near loc_{b:02x}_{t:04x}")
+            elif t in bn_to_b0_idx:
+                disp_bn_lines.append(f"    je  near .jp_b0_{t:04x}")
+        disp_bn_lines.append("    add di, 2")
+        disp_bn_lines.append("    ret")
+        for t in sorted(jp_hl_targets[b]):
+            if t < 0x4000 and t in bn_to_b0_idx:
+                disp_bn_lines.append(f".jp_b0_{t:04x}:")
+                disp_bn_lines.append(f"    call near call_bank0_{t:04x}")
+                disp_bn_lines.append("    ret")
+
+        disp_bn_lines.append("\n; Far call helpers for calling Bank 0 (b0_entry_table starts at offset 32)")
         for t in bn_to_b0:
             idx = bn_to_b0_idx[t]
             disp_bn_lines.append(f"global call_bank0_{t:04x}")
             disp_bn_lines.append(f"call_bank0_{t:04x}:")
-            disp_bn_lines.append(f"    mov ax, cs")
-            disp_bn_lines.append(f"    sub ax, SEG{b}_PARAS_VAL")
-            disp_bn_lines.append(f"    push ax")
-            disp_bn_lines.append(f"    push word (4 + {idx * 4})")
-            disp_bn_lines.append(f"    mov bp, sp")
-            disp_bn_lines.append(f"    call far [bp]")
-            disp_bn_lines.append(f"    add sp, 4")
-            disp_bn_lines.append(f"    ret")
+            disp_bn_lines.append("    push bp")
+            disp_bn_lines.append("    mov bp, cs")
+            disp_bn_lines.append("    sub bp, SEG_PARAS_VAL")
+            disp_bn_lines.append("    push bp")
+            disp_bn_lines.append(f"    push word (32 + {idx * 4})")
+            disp_bn_lines.append("    mov bp, sp")
+            disp_bn_lines.append("    call far [bp]")
+            disp_bn_lines.append("    add sp, 4")
+            disp_bn_lines.append("    pop bp")
+            disp_bn_lines.append("    ret")
 
         with open(f"{OUT_DIR}/dispatch_b{b}.asm", "w") as f:
             f.write("\n".join(disp_bn_lines) + "\n")
 
-    # 3. Emit Recompiled Code for Bank 0..3
+    # 3. Emit Recompiled Code for Bank 0..3 with Label-Resynchronized Disassembly
     for b in range(4):
         start_addr = 0x0000 if b == 0 else 0x4000
         end_addr = 0x4000 if b == 0 else 0x8000
         cg = CodeGenerator80186(disasm)
+
+        # Pre-populate cg.labels with discovered control-flow labels
+        for l_addr in bank_labels[b]:
+            cg.labels.add((b, l_addr))
+
+        # Now disassemble with label-resynchronization at ALL known labels in cg.labels
+        all_lbl_addrs = sorted(addr for (bk, addr) in cg.labels if bk == b and start_addr <= addr < end_addr)
+        lbl_set = set(all_lbl_addrs)
 
         lines = [
             f"; Bank {b:02X} Recompiled Code",
@@ -171,53 +449,91 @@ def main():
         ]
 
         curr = start_addr
-        instructions = []
         while curr < end_addr:
-            instr = disasm.decode_instr(b, curr)
-            instructions.append(instr)
-            curr += max(1, instr.length)
-            if instr.target_addr is not None and start_addr <= instr.target_addr < end_addr:
-                cg.labels.add((b, instr.target_addr))
-
-        if b == 0:
-            for vec in [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x100, 0x150, 0x3F92]:
-                cg.labels.add((0, vec))
-            for t in bn_to_b0:
-                cg.labels.add((0, t))
-        else:
-            for t in b0_to_bn:
-                cg.labels.add((b, t))
-
-        for instr in instructions:
-            if (b, instr.addr) in cg.labels:
-                lbl = cg.label_name(b, instr.addr)
+            if curr in lbl_set:
+                lbl = cg.label_name(b, curr)
                 lines.append(f"global {lbl}")
                 lines.append(f"{lbl}:")
 
-            # Route cross-bank calls
-            if instr.is_call and instr.target_addr is not None:
+            instr = disasm.decode_instr(b, curr)
+            next_c = curr + max(1, instr.length)
+
+            # Check if this instruction would step over a known label!
+            stepped_over = None
+            for k in range(curr + 1, next_c):
+                if k in lbl_set:
+                    stepped_over = k
+                    break
+            if stepped_over is not None:
+                # Emit raw bytes up to the label so disassembly stays 100% synchronized!
+                for k in range(curr, stepped_over):
+                    bval = disasm.read_u8(b, k)
+                    lines.append(f"    db 0{bval:02X}h")
+                curr = stepped_over
+                continue
+
+            # Special handling for JP (HL) inside an inline RST jump-table dispatcher (e.g. 0x0033 in Bank 0):
+            # Pop the native return address pushed by `call near loc_00_0028` before jumping!
+            if b == 0 and curr in pop_jp_hl_addrs and instr.mnemonic == "JP (HL)":
+                lines.append("    add sp, 2")
+                lines.append("    mov si, cx")
+                lines.append("    jmp near helper_dispatch_jp_hl")
+                curr = next_c
+                continue
+
+            # Route cross-bank CALL and cross-bank JP (including conditional CALL cc / JP cc)
+            if (instr.is_call or instr.is_branch) and instr.target_addr is not None:
                 t = instr.target_addr
-                next_addr = f"0{(instr.addr + instr.length):04X}h"
+                m = instr.mnemonic
+                next_addr = f"0{next_c:04X}h"
+
+                # Determine if cross-bank
+                cross_call_line = None
                 if b == 0 and t >= 0x4000:
                     if t in b0_to_bn_idx:
-                        call_line = f"call near dispatch_call_{t:04x}"
+                        cross_call_line = f"call near dispatch_call_{t:04x}"
                     elif t >= 0xFF80:
-                        # HRAM OAM DMA routine call
-                        call_line = "call near loc_00_3f92"
+                        cross_call_line = "call near loc_00_3f92"
                     else:
+                        curr = next_c
                         continue
-                    lines.append(f"    sub di, 2")
-                    lines.append(f"    mov word [di], {next_addr}")
-                    lines.append(f"    {call_line}")
-                    continue
                 elif b > 0 and t < 0x4000:
                     if t in bn_to_b0_idx:
-                        call_line = f"call near call_bank0_{t:04x}"
+                        cross_call_line = f"call near call_bank0_{t:04x}"
                     else:
+                        curr = next_c
                         continue
-                    lines.append(f"    sub di, 2")
-                    lines.append(f"    mov word [di], {next_addr}")
-                    lines.append(f"    {call_line}")
+
+                if cross_call_line is not None:
+                    parts = m.split()[1].split(", ")
+                    is_cond = len(parts) > 1
+                    cond = parts[0] if is_cond else None
+                    neg_jcc = {"Z": "jnz", "NZ": "jz", "C": "jnc", "NC": "jc"}.get(cond, "jmp")
+
+                    if instr.is_call:
+                        if is_cond:
+                            lbl_skip = f".skip_cc_{curr:04x}"
+                            lines.append(f"    {neg_jcc} short {lbl_skip}")
+                            lines.append("    sub di, 2")
+                            lines.append(f"    mov word [di], {next_addr}")
+                            lines.append(f"    {cross_call_line}")
+                            lines.append(f"{lbl_skip}:")
+                        else:
+                            lines.append("    sub di, 2")
+                            lines.append(f"    mov word [di], {next_addr}")
+                            lines.append(f"    {cross_call_line}")
+                    else:
+                        # Cross-bank JP / JP cc (tail jump: target will execute add di, 2; ret)
+                        if is_cond:
+                            lbl_skip = f".skip_cj_{curr:04x}"
+                            lines.append(f"    {neg_jcc} short {lbl_skip}")
+                            lines.append(f"    {cross_call_line}")
+                            lines.append("    ret")
+                            lines.append(f"{lbl_skip}:")
+                        else:
+                            lines.append(f"    {cross_call_line}")
+                            lines.append("    ret")
+                    curr = next_c
                     continue
 
             x86_ops = cg.translate_instruction(instr)
@@ -226,17 +542,20 @@ def main():
                 for extra in x86_ops[1:]:
                     lines.append(f"    {extra}")
 
+            curr = next_c
+
         with open(f"{OUT_DIR}/code_b{b}.asm", "w") as f:
             f.write("\n".join(lines) + "\n")
         print(f"[gb200lx] Emitted code for Bank {b}")
 
-    # 4. Generate Stubs for Unresolved Internal Branch Targets
+    # 4. Generate Stubs for Any Remaining Unresolved Internal Branch Targets
     for b in range(4):
         defined = set()
         called = set()
         files_to_scan = [f"{OUT_DIR}/code_b{b}.asm", f"{OUT_DIR}/dispatch_b{b}.asm"]
         if b == 0:
             files_to_scan.append("runtime/crt0_rom.asm")
+            files_to_scan.append("runtime/recomp_helpers.asm")
         for fn in files_to_scan:
             if not os.path.exists(fn):
                 continue
@@ -253,20 +572,24 @@ def main():
         with open(f"{OUT_DIR}/stubs_b{b}.asm", "w") as f:
             f.write("bits 16\ncpu 186\n\n")
             for m in sorted(missing):
-                f.write(f"global {m}\n{m}:\n    ret\n")
+                f.write(f"global {m}\n{m}:\n    add di, 2\n    ret\n")
         print(f"[gb200lx] Bank {b}: {len(defined)} defined, {len(missing)} stubs")
 
-    # 5. Assemble Dummy Segment 0 to get initial sizes
+    # 5. Assemble Pass 1 to get exact segment paragraph sizes
     seg0_header = f"""
 bits 16
 cpu 186
 org 0
 
 %define SEG_IS_BANK0 1
+%define SEG1_PARAS_VAL 01111h
+%define SEG2_PARAS_VAL 02222h
+%define SEG3_PARAS_VAL 03333h
+%define SEG_ROM_PARAS_VAL 04444h
 
 entry_trampoline:
     jmp near entry
-    nop                         ; Align b0_entry_table to exactly offset 4!
+    nop                         ; Align b0_helper_table to exact offset 4!
 
 %include "{OUT_DIR}/dispatch_b0.asm"
 %include "runtime/crt0_rom.asm"
@@ -285,16 +608,14 @@ image_end:
     print("[gb200lx] Pass 1: Assembling Segment 0...")
     subprocess.run(["nasm", "-f", "bin", "-I./", "-o", f"{OUT_DIR}/seg0.bin", f"{OUT_DIR}/seg0.asm"], check=True)
 
-    # Segments 1..3 Pass 1
+    # Segments 1..3 Pass 1 (b{b}_entry_table at exact offset 0!)
     for b in [1, 2, 3]:
         seg_asm = f"""
 bits 16
 cpu 186
 org 0
 
-%define SEG{b}_PARAS_VAL 0
-seg_rom_data: dw 0
-gb_mem_seg: dw 0
+%define SEG_PARAS_VAL 01111h
 
 %include "{OUT_DIR}/dispatch_b{b}.asm"
 %include "{OUT_DIR}/stubs_b{b}.asm"
@@ -374,9 +695,7 @@ bits 16
 cpu 186
 org 0
 
-%define SEG{b}_PARAS_VAL 0
-seg_rom_data: dw 0
-gb_mem_seg: dw 0{para_val:04X}h
+%define SEG_PARAS_VAL 0{para_val:04X}h
 
 %include "{OUT_DIR}/dispatch_b{b}.asm"
 %include "{OUT_DIR}/stubs_b{b}.asm"
@@ -413,6 +732,7 @@ gb_mem_seg: dw 0{para_val:04X}h
     # Copy INI file to build dir
     subprocess.run(["cp", "GB200LX.INI", f"{BUILD_DIR}/GB200LX.INI"], check=True)
     print(f"[gb200lx] Copied GB200LX.INI -> {BUILD_DIR}/GB200LX.INI")
+
 
 if __name__ == "__main__":
     main()
