@@ -1,0 +1,23 @@
+# Build outputs & local ROMs
+build/
+roms/
+*.gb
+*.gbc
+*.bin
+*.exe
+*.com
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs & temp
+*.log
+*.tmp
+INT06.TXT
+HALT.TXT
+RESULT.TXT
+OUT.TXT
+
+# OS files
+.DS_Store
