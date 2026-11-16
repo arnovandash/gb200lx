@@ -139,6 +139,37 @@ def load_cdl_seeds(cdl_path: str, rom_size: int) -> Tuple[Set[int], Dict[int, Se
     return b0_seeds, bn_seeds
 
 
+# SM83 mnemonics (prefixes) that read the current flags
+_FLAG_READERS = ("ADC ", "SBC ", "RLA", "RRA", "RL ", "RR ", "DAA", "CCF", "PUSH AF", "BIT ", "DB ")
+# Mnemonics whose translation redefines every flag a later reader can use (ZF, CF, AF)
+_FLAG_KILLERS = ("ADD A, ", "SUB A, ", "AND A, ", "OR A, ", "XOR A, ", "CP A, ",
+                 "SLA ", "SRA ", "SRL ", "SWAP ", "RLC ", "RRC ", "POP AF")
+# Control transfers / yields: flags may be observed elsewhere, so treat as live
+_FLAG_BARRIERS = ("JR", "JP", "CALL", "RET", "RST", "HALT", "STOP")
+
+
+def flags_dead_after(disasm: SM83Disassembler, bank: int, addr: int, end_addr: int,
+                     lbl_set: Set[int], window: int = 16) -> bool:
+    """Conservative straight-line flag liveness: True only if, starting at `addr`,
+    an instruction that fully redefines the flags is reached before any flag reader,
+    control transfer, branch-target label, or the end of the scan window."""
+    for _ in range(window):
+        if addr >= end_addr or addr in lbl_set:
+            return False
+        ins = disasm.decode_instr(bank, addr)
+        if ins.length < 1 or any(k in lbl_set for k in range(addr + 1, addr + ins.length)):
+            return False
+        m = ins.mnemonic
+        if ins.is_branch or ins.is_call or ins.is_ret or m.startswith(_FLAG_BARRIERS):
+            return False
+        if m.startswith(_FLAG_READERS):
+            return False
+        if m.startswith(_FLAG_KILLERS):
+            return True
+        addr += ins.length
+    return False
+
+
 def discover_control_flow(
     disasm: SM83Disassembler,
     rst_table_vecs: Set[int],
@@ -743,6 +774,10 @@ def main():
                     curr = next_c
                     continue
 
+            cg.flags_dead = flags_dead_after(disasm, b, next_c, end_addr, lbl_set)
+            # Inline RAM-write fast paths: +~12 KiB per bank and no measurable speedup in
+            # DOSBox-X at 7910 cycles (frame time is render-bound), so keep helper calls.
+            cg.inline_writes = False
             x86_ops = cg.translate_instruction(instr)
             if x86_ops:
                 lines.append(f"    {x86_ops[0]}")

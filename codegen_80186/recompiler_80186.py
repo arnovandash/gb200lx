@@ -328,6 +328,28 @@ class CodeGenerator80186:
         self.disasm = disasm
         self.labels: Set[Tuple[int, int]] = set()
         self.last_alu_sub: bool = False
+        # Set by the caller before each translate_instruction():
+        # flags_dead   -> no SM83 flag is read before being fully redefined, so
+        #                 flag-preserving lahf/sahf sequences may be dropped.
+        # inline_writes -> emit an inline fast path for WRAM/cart-RAM writes
+        #                 (0xA000..0xFDFF) instead of always calling the helper.
+        self.flags_dead: bool = False
+        self.inline_writes: bool = False
+
+    def _indirect_write(self, addr: int, base: str, store: List[str], helper: str) -> List[str]:
+        """Write AL to [base]. Fast inline store for 0xA000..0xFDFF (plain RAM, never
+        VRAM/OAM/MMIO/MBC), falling back to the range-checking helper otherwise.
+        Preserves SM83 flags (ZF/CF/AF via lahf/sahf) unless flags_dead."""
+        if not self.inline_writes:
+            return [f"call {helper}"]
+        keep = [] if self.flags_dead else ["sahf"]
+        ls, ld = f".ws_{addr:04x}", f".wd_{addr:04x}"
+        return (([] if self.flags_dead else ["lahf"]) +
+                [f"mov bp, {base}", "sub bp, 0A000h", "cmp bp, 05E00h", f"jae short {ls}"] +
+                keep + store + [f"jmp short {ld}", f"{ls}:"] + keep + [f"call {helper}", f"{ld}:"])
+
+    def _write_hl(self, addr: int) -> List[str]:
+        return ["mov si, cx"] + self._indirect_write(addr, "cx", ["mov [si], al"], "helper_write_hl")
 
     def label_name(self, bank: int, addr: int) -> str:
         # Bank 0 is always in segment 0
@@ -382,14 +404,14 @@ class CodeGenerator80186:
 
             # LD (HL), A
             if dst == "(HL)" and src == "A":
-                return ["mov si, cx", "call helper_write_hl"]
+                return self._write_hl(addr)
             # LD (HL), r
             if dst == "(HL)":
                 if src.startswith("0x"):
                     imm = src.replace("0x", "0") + "h"
-                    return ["push ax", f"mov al, {imm}", "mov si, cx", "call helper_write_hl", "pop ax"]
+                    return ["push ax", f"mov al, {imm}"] + self._write_hl(addr) + ["pop ax"]
                 xsrc = REG8_TO_X86.get(src, 'al')
-                return ["push ax", f"mov al, {xsrc}", "mov si, cx", "call helper_write_hl", "pop ax"]
+                return ["push ax", f"mov al, {xsrc}"] + self._write_hl(addr) + ["pop ax"]
             # LD r, (HL)
             if src == "(HL)":
                 xdst = REG8_TO_X86.get(dst, 'al')
@@ -486,23 +508,23 @@ class CodeGenerator80186:
 
         # Indirect (BC) / (DE)
         if m == "LD (BC), A":
-            return ["call helper_write_bc"]
+            return self._indirect_write(addr, "bx", ["mov [bx], al"], "helper_write_bc")
         if m == "LD A, (BC)":
             return ["mov al, [bx]"]
         if m == "LD (DE), A":
-            return ["call helper_write_de"]
+            return self._indirect_write(addr, "dx", ["mov si, dx", "mov [si], al"], "helper_write_de")
         if m == "LD A, (DE)":
             return ["mov bp, dx", "mov al, [ds:bp]"]
 
         # LDI / LDD
         if m == "LDI (HL), A":
-            return ["mov si, cx", "call helper_write_hl", "inc cx"]
+            return ["mov si, cx", "lea cx, [si + 1]"] + self._indirect_write(addr, "si", ["mov [si], al"], "helper_write_hl")
         if m == "LDI A, (HL)":
-            return ["mov si, cx", "mov al, [si]", "inc cx"]
+            return ["mov si, cx", "mov al, [si]", "lea cx, [si + 1]"]
         if m == "LDD (HL), A":
-            return ["mov si, cx", "call helper_write_hl", "dec cx"]
+            return ["mov si, cx", "lea cx, [si - 1]"] + self._indirect_write(addr, "si", ["mov [si], al"], "helper_write_hl")
         if m == "LDD A, (HL)":
-            return ["mov si, cx", "mov al, [si]", "dec cx"]
+            return ["mov si, cx", "mov al, [si]", "lea cx, [si - 1]"]
 
         # 3. ALU 8-bit
         alu_ops = {
@@ -541,6 +563,8 @@ class CodeGenerator80186:
                 if xr in ("bx", "di"):
                     return [f"lea {xr}, [{xr} + 1]"]
                 else:
+                    if self.flags_dead:
+                        return [f"inc {xr}"]
                     return ["lahf", f"inc {xr}", "sahf"]
 
         if m.startswith("DEC "):
@@ -556,6 +580,8 @@ class CodeGenerator80186:
                 if xr in ("bx", "di"):
                     return [f"lea {xr}, [{xr} - 1]"]
                 else:
+                    if self.flags_dead:
+                        return [f"dec {xr}"]
                     return ["lahf", f"dec {xr}", "sahf"]
 
         # ADD HL, rr: In SM83, ADD HL, rr preserves ZF and updates CF!
@@ -563,6 +589,8 @@ class CodeGenerator80186:
             rr = m[8:]
             if rr in REG16_TO_X86:
                 xr = REG16_TO_X86[rr]
+                if self.flags_dead:
+                    return [f"add cx, {xr}"]
                 return [
                     "lahf",
                     "and ah, 0FEh",
@@ -661,8 +689,12 @@ class CodeGenerator80186:
                 r = m.split()[1]
                 if r in REG8_TO_X86:
                     xr = REG8_TO_X86[r]
+                    if self.flags_dead:
+                        return [f"{rot_op} {xr}, 1"]
                     return [f"{rot_op} {xr}, 1", "lahf", f"test {xr}, {xr}", "rcr ah, 1"]
                 elif r == "(HL)":
+                    if self.flags_dead:
+                        return ["mov si, cx", f"{rot_op} byte [si], 1"]
                     return ["mov si, cx", f"{rot_op} byte [si], 1", "lahf", "cmp byte [si], 0", "rcr ah, 1"]
 
         # 7. Control Flow: JR / JP

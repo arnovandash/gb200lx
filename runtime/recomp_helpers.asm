@@ -95,6 +95,18 @@ helper_pop_af:
 
 global helper_write_hl
 helper_write_hl:
+    ; Fast path: 0xA000..0xFDFF is plain RAM (no VRAM/OAM/MMIO/MBC side effects).
+    ; lahf/sahf keep ZF/CF/AF (AH is scratch in recompiled code).
+    lahf
+    mov     bp, si
+    sub     bp, 0A000h
+    cmp     bp, 05E00h
+    jae     short .hl_checked
+    sahf
+    mov     [si], al
+    ret
+.hl_checked:
+    sahf
     pushf
     cmp     si, 08000h
     jb      short .hl_mbc
@@ -122,6 +134,18 @@ helper_write_hl:
 ; ------------------------------------------------------------------------------
 global helper_write_bc
 helper_write_bc:
+    ; Fast path: 0xA000..0xFDFF is plain RAM (no VRAM/OAM/MMIO/MBC side effects).
+    ; lahf/sahf keep ZF/CF/AF (AH is scratch in recompiled code).
+    lahf
+    mov     bp, bx
+    sub     bp, 0A000h
+    cmp     bp, 05E00h
+    jae     short .bc_checked
+    sahf
+    mov     [bx], al
+    ret
+.bc_checked:
+    sahf
     pushf
     cmp     bx, 08000h
     jb      short .bc_mbc
@@ -149,6 +173,19 @@ helper_write_bc:
 ; ------------------------------------------------------------------------------
 global helper_write_de
 helper_write_de:
+    ; Fast path: 0xA000..0xFDFF is plain RAM (no VRAM/OAM/MMIO/MBC side effects).
+    ; lahf/sahf keep ZF/CF/AF (AH is scratch in recompiled code).
+    lahf
+    mov     bp, dx
+    sub     bp, 0A000h
+    cmp     bp, 05E00h
+    jae     short .de_checked
+    sahf
+    mov     bp, dx
+    mov     [ds:bp], al
+    ret
+.de_checked:
+    sahf
     pushf
     cmp     dx, 08000h
     jb      short .de_mbc
