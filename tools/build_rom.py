@@ -196,6 +196,51 @@ def discover_control_flow(
 
     b0_vis: Set[int] = set()
     b0_interior: Set[int] = set()
+    ptr_setter_cache: Dict[Tuple[int, str], bool] = {}
+
+    def is_ptr_setter(fn_addr: int, rr: str) -> bool:
+        """Detect short acyclic helpers that store a 16-bit register pair into RAM
+        as a function pointer (e.g. VBlank callback registration) without dereferencing it."""
+        key = (fn_addr, rr)
+        if key in ptr_setter_cache:
+            return ptr_setter_cache[key]
+        lo, hi = {"DE": ("E", "D"), "BC": ("C", "B"), "HL": ("L", "H")}[rr]
+        c = fn_addr
+        stored_lo = stored_hi = False
+        a_src = None
+        res = False
+        for _ in range(18):
+            if not (0 <= c < 0x4000):
+                break
+            ins2 = disasm.decode_instr(0, c)
+            m2 = ins2.mnemonic
+            if m2.startswith(("JR ", "JP ", "CALL ")) and ins2.target_addr is not None and ins2.target_addr <= c:
+                break
+            if m2 in (f"LD A, ({rr})", f"LDI A, ({rr})", f"LDD A, ({rr})"):
+                break
+            if m2 == f"LD A, {lo}":
+                a_src = "lo"
+            elif m2 == f"LD A, {hi}":
+                a_src = "hi"
+            elif m2.startswith("LD (") and m2.endswith(f", {lo}"):
+                stored_lo = True
+            elif m2.startswith("LD (") and m2.endswith(f", {hi}"):
+                stored_hi = True
+            elif a_src == "lo" and m2.startswith(("LD (", "LDH (")) and m2.endswith(", A"):
+                stored_lo = True
+            elif a_src == "hi" and m2.startswith(("LD (", "LDH (")) and m2.endswith(", A"):
+                stored_hi = True
+            elif m2.startswith(("LD A, ", "XOR A", "POP ", "DEC ", "INC ")) and not m2.startswith(f"INC {rr}"):
+                if "A" in m2.split(",")[0]:
+                    a_src = None
+            if m2 in ("RET", "RETI"):
+                res = stored_lo and stored_hi
+                break
+            if ins2.is_unconditional_jump:
+                break
+            c += ins2.length
+        ptr_setter_cache[key] = res
+        return res
 
     def trace_b0_worklist(wl: List[int]):
         while wl:
@@ -238,6 +283,7 @@ def discover_control_flow(
                 continue
 
             # Detect `LD BC/DE/HL, imm16; PUSH BC/DE/HL` synthetic return-address pushes (e.g. LZ77 loop return)
+            # or `LD BC/DE/HL, imm16; CALL/JP setter_fn` callback pointer registrations for JP (HL).
             if ins.length == 3 and m.startswith(("LD BC, 0x", "LD DE, 0x", "LD HL, 0x")):
                 rr = m[3:5]
                 imm = int(m.split(", ")[1], 16)
@@ -245,6 +291,19 @@ def discover_control_flow(
                 if next_ins.mnemonic == f"PUSH {rr}" and 0x0150 <= imm < 0x4000:
                     bank_labels[0].add(imm)
                     wl.append(imm)
+                elif ((next_ins.is_call or next_ins.is_unconditional_jump)
+                      and next_ins.target_addr is not None
+                      and next_ins.target_addr < 0x4000
+                      and is_ptr_setter(next_ins.target_addr, rr)):
+                    if 0x0150 <= imm < 0x4000:
+                        jp_hl_targets[0].add(imm)
+                        bank_labels[0].add(imm)
+                        wl.append(imm)
+                    elif 0x4000 <= imm < 0x8000:
+                        jp_hl_targets[0].add(imm)
+                        b0_to_bn_set.add(imm)
+                    elif imm >= 0xFF80:
+                        jp_hl_targets[0].add(imm)
 
             if ins.target_addr is not None:
                 t = ins.target_addr
@@ -529,8 +588,13 @@ def main():
         disp_b0_lines.append(f"    cmp cx, 0{t:04X}h")
         if t < 0x4000:
             disp_b0_lines.append(f"    je  near loc_00_{t:04x}")
+        elif t >= 0xFF80:
+            disp_b0_lines.append(f"    je  near loc_00_{hram_dma_addr:04x}")
         else:
             disp_b0_lines.append(f"    je  near dispatch_call_{t:04x}")
+    if 0xFF80 not in jp_hl_targets[0]:
+        disp_b0_lines.append("    cmp cx, 0FF80h")
+        disp_b0_lines.append(f"    je  near loc_00_{hram_dma_addr:04x}")
     disp_b0_lines.append("    lea di, [di + 2]")
     disp_b0_lines.append("    ret")
     disp_b0_lines.append("")
