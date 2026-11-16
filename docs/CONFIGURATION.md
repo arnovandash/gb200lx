@@ -1,20 +1,20 @@
 # GB200LX Configuration & User Guide
 
-This guide describes how to configure video scaling, palettes, and controls for recompiled games targeting the HP 200LX.
+This guide describes how to configure palettes, viewport options, and keyboard mappings for recompiled games targeting the HP 200LX and DOSBox-X.
 
 ---
 
 ## 1. Overview
 
-GB200LX provides two convenient ways to customize settings:
-1. **Directly editing `GB200LX.INI`:** A standard ASCII configuration file placed alongside the executable.
-2. **Interactive `/SETUP` Wizard:** A built-in, full-screen MS-DOS text mode configurator designed for the HP 200LX palmtop keyboard.
+GB200LX provides two ways to customize runtime settings:
+1. **Editing `GB200LX.INI`:** An ASCII configuration file placed in the same directory as the `.EXE`.
+2. **Interactive `/SETUP` Wizard:** A built-in MS-DOS text-mode configurator designed for the HP 200LX keyboard.
 
 ---
 
 ## 2. Configuration File Specification (`GB200LX.INI`)
 
-If `GB200LX.INI` is absent when the game is launched, it is automatically created with factory defaults.
+If `GB200LX.INI` is missing when the executable starts, it is automatically created with factory defaults:
 
 ```ini
 [video]
@@ -36,56 +36,53 @@ key_menu = ESC
 
 ### Video Section (`[video]`)
 
-| Parameter | Options | Default | Description |
+| Parameter | Options | Default | Notes |
 | :--- | :--- | :--- | :--- |
-| **`scaling`** | `center`, `wide` | `center` | `center`: Displays the native 160×144 viewport with a border at screen coordinates `(80, 28)`.<br>`wide`: Horizontally stretches pixels across 320 columns. |
-| **`palette`** | `pocket`, `dmg`, `high_con`, `dark` | `pocket` | Selects the 4-shade grayscale mapping for the HP 200LX LCD. |
+| **`palette`** | `pocket`, `dmg`, `high_con`, `dark` | `pocket` | Selects the 4-shade CGA grayscale mapping (`cfg_shade0..3`). |
+| **`scaling`** | `center`, `wide` | `center` | Stored in INI and `/SETUP` (`center` = 160×144 viewport centered at `(80, 28)`). |
+| **`vsync`** | `1`, `0` | `1` | Kept for INI compatibility; frame pacing is governed by the 59.73 Hz PIT `INT 08h` clock. |
 
 #### Palette Presets
 
-| Palette | Shade 0 (Lightest) | Shade 1 (Light) | Shade 2 (Dark) | Shade 3 (Darkest) | Notes |
+| Palette | Shade 0 | Shade 1 | Shade 2 | Shade 3 | Notes |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`pocket`** | White | Light Gray | Dark Gray | Black | Clear, crisp Game Boy Pocket look (Recommended for HP 200LX) |
-| **`dmg`** | Light Gray | White | Dark Gray | Black | Classic DMG greenish-gray mapping |
-| **`high_con`**| White | White | Black | Black | Maximum contrast 2-shade style; highly visible under poor lighting |
-| **`dark`** | Dark Gray | Black | Light Gray | White | Inverted night mode |
+| **`pocket`** | White (`00b`) | Light Gray (`01b`) | Dark Gray (`10b`) | Black (`11b`) | Crisp 4-shade mapping (default) |
+| **`dmg`** | White (`00b`) | Light Gray (`01b`) | Dark Gray (`10b`) | Black (`11b`) | Classic 4-shade mapping |
+| **`high_con`** | White (`00b`) | White (`00b`) | Black (`11b`) | Black (`11b`) | Maximum 2-shade contrast for dim lighting |
+| **`dark`** | Black (`11b`) | Dark Gray (`10b`) | Light Gray (`01b`) | White (`00b`) | Inverted mode |
 
 ---
 
-### Input Section (`[input]`)
+## 3. Input Section (`[input]`)
 
-Controls can be assigned using human-readable key names.
-
-| Setting | Function | Default | Typical HP 200LX Recommendation |
+| Setting | Game Boy Button | Default | Notes |
 | :--- | :--- | :--- | :--- |
-| **`key_up`** | D-Pad Up | `UP` | Arrow Up |
-| **`key_down`** | D-Pad Down | `DOWN` | Arrow Down |
-| **`key_left`** | D-Pad Left | `LEFT` | Arrow Left |
-| **`key_right`**| D-Pad Right | `RIGHT` | Arrow Right |
-| **`key_a`** | Game Boy A Button | `Z` | `Z` or `SPACE` |
-| **`key_b`** | Game Boy B Button | `X` | `X` or `ENTER` |
-| **`key_start`**| Start Button | `ENTER` | `ENTER` or `S` |
-| **`key_select`**| Select Button | `SPACE` | `SPACE` or `D` |
-| **`key_menu`**| Exit to DOS | `ESC` | `ESC` |
+| **`key_up`** | D-Pad Up | `UP` | Extended `0xE0` arrow prefixes are handled automatically |
+| **`key_down`** | D-Pad Down | `DOWN` | |
+| **`key_left`** | D-Pad Left | `LEFT` | |
+| **`key_right`** | D-Pad Right | `RIGHT` | |
+| **`key_a`** | A Button | `Z` | |
+| **`key_b`** | B Button | `X` | |
+| **`key_select`** | Select | `SPACE` | |
+| **`key_start`** | Start | `ENTER` | |
+| **`key_menu`** | Exit to DOS | `ESC` | Restores PIT timer, `INT 08h`/`09h`, and text mode |
 
-#### Supported Key Names
+### Supported Key Names
 - **Letters:** `A` through `Z`
 - **Numbers:** `0` through `9`
 - **Arrow Keys:** `UP`, `DOWN`, `LEFT`, `RIGHT`
 - **Special Keys:** `SPACE`, `ENTER`, `ESC`, `TAB`, `LSHIFT`, `RSHIFT`, `LCTRL`, `LALT`
-- **Raw Hex Codes:** `0x48`, `0x50`, `0x4B`, `0x4D`, etc.
+- **Raw Hex Scancodes:** `0x48`, `0x50`, `0x4B`, `0x4D`, etc.
 
 ---
 
-## 3. Interactive Setup Mode (`/SETUP`)
+## 4. Interactive Setup Mode (`/SETUP`) & Test Mode (`/t`)
 
-You can launch the configuration screen on your palmtop or in DOSBox at any time:
-
+Launch `/SETUP` directly on the HP 200LX or via `make setup` in DOSBox-X:
 ```dos
 C:\GAMES> GAME.EXE /SETUP
 ```
+- Select an action and press the desired key to capture its hardware scancode.
+- Toggle palettes and save directly back to `GB200LX.INI` (press `ENTER` to save and start, or `ESC` to cancel).
 
-### Features
-1. **Interactive Key Capturing:** Select any action and press the desired key on the keyboard. The scancode is detected and registered immediately.
-2. **Palette Toggle:** Cycle through available palettes to preview shade contrast on your physical LCD display.
-3. **Save and Exit:** Press `ENTER` to save modifications directly to `GB200LX.INI` and start the game, or press `ESC` to cancel and return to DOS.
+For automated verification, passing `/t` (used by `make test`) runs 120 frames, dumps CGA VRAM (`0xB800`) to `CGA_VRAM.BIN`, and exits cleanly to DOS.

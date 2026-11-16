@@ -1,34 +1,60 @@
 # GB200LX: Static Game Boy AOT Recompiler for HP 200LX (80186 MS-DOS)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Target: 80186 MS-DOS](https://img.shields.io/badge/Target-80186%20MS--DOS-green.svg)](#hardware-target)
+[![Target: 80186 MS-DOS](https://img.shields.io/badge/Target-80186%20MS--DOS-green.svg)](#hp-200lx-hardware-overview)
 [![Platform: HP 200LX](https://img.shields.io/badge/Palmtop-HP%20200LX%20%2F%20100LX-orange.svg)](#hp-200lx-hardware-overview)
 
-**GB200LX** is an ahead-of-time (AOT) static binary recompiler that translates original Game Boy (Sharp SM83 / LR35902) ROMs directly into native 16-bit x86 assembly (`bits 16`, `cpu 186`), producing standalone, self-contained MS-DOS `.EXE` binaries. It is specifically tailored to run at full speed (60 FPS) on the vintage **HP 200LX palmtop PC** powered by an Intel Hornet 80186 ASIC at 7.91 MHz with 636 KiB of conventional RAM and a 320×200 4-shade grayscale CGA display.
+**GB200LX** is a "Bring Your Own ROM" ahead-of-time (AOT) static binary recompiler that translates original Game Boy (DMG / Sharp SM83) ROMs into native 16-bit x86 assembly (`bits 16`, `cpu 186`), producing standalone, self-contained MS-DOS `.EXE` binaries targeting the **HP 200LX palmtop PC** (7.91 MHz Intel Hornet 80186, 636 KiB conventional RAM, 320×200 4-shade grayscale CGA display).
+
+---
+
+## Screenshots (DOSBox-X `80186` + `cga` Emulation)
+
+| *Super Mario Land* (World 1-1) | *Tetris* (Rosy Retrospection) | *Bubble Ghost* (Hall 02) |
+| :---: | :---: | :---: |
+| ![Super Mario Land on GB200LX](docs/screenshots/super_mario_land.png) | ![Tetris on GB200LX](docs/screenshots/tetris.png) | ![Bubble Ghost on GB200LX](docs/screenshots/bubble_ghost.png) |
+
+> [!NOTE]
+> Under desktop DOSBox-X in CGA Mode 04h (Palette 0), the 2-bit pixel values (`00b..11b`) display as black/green/red/yellow. On the HP 200LX LCD hardware, those exact 2-bit pixel values map directly to four physical shades of gray.
+
+---
+
+## Current Status & Compatibility
+
+- **Supported ROMs:** Unmodified 32 KiB (ROM-only) and 64 KiB (MBC1, up to 4 × 16 KiB banks) DMG `.gb` ROMs statically mapped into 16-bit code segments.
+- **Verified Playable Titles:**
+  - *Super Mario Land (World) (Rev 1)* — full gameplay including `STAT`/`LYC` split-scroll HUD, 1-pixel `SCX` scrolling, sprites, pipes (OAM BG priority), and BCD timer.
+  - *Tetris - Rosy Retrospection (v1.2)* — Window/BG rendering and gameplay.
+  - *Bubble Ghost (USA, Europe)* — sprites, Window HUD, and full-speed gameplay.
+- **Current Limitations:**
+  - ROMs larger than 64 KiB (e.g., 1 MiB MBC3 titles) are not yet supported (would require disk-paged bank overlays and SRAM persistence).
+  - Game Boy APU audio / PC speaker output is not yet implemented.
 
 ---
 
 ## Why Static Recompilation?
 
-Emulating a 4.19 MHz Game Boy CPU instruction-by-instruction via a traditional software interpreter requires fetching, decoding, updating register structs, evaluating flag arithmetic, and polling hardware timers on every instruction. On an Intel 80186 clocked at 7.91 MHz, software emulation achieves less than 5–10 FPS—far too slow for playable gaming.
+Interpreting a 4.19 MHz Sharp SM83 CPU instruction-by-instruction on a 7.91 MHz 80186 leaves far too few cycles per Game Boy opcode for playable frame rates.
 
-**GB200LX takes a completely different path:**
-- **Zero Interpretation Overhead:** Each SM83 instruction is lifted ahead of time into 1–3 native 16-bit x86 instructions.
-- **Physical Register Pinning:** All Game Boy CPU registers remain permanently mapped to physical 80186 CPU registers across basic blocks. No RAM load/store overhead per instruction.
-- **Micro-Optimized CGA Conversion:** Converts DMG 2bpp planar tilemaps into CGA Mode 04h 2bpp packed words using an ultra-fast 256-byte nibble lookup table, consuming **less than 1%** of Hornet CPU time (~72,000 cycles/frame at 7.91 MHz).
-- **Relocation-Free Segmentation:** Multi-bank ROMs (such as 64 KiB MBC1 titles like *Super Mario Land*) are split into discrete 16-bit code segments with precomputed far-call dispatch trampolines, overcoming the MS-DOS 64 KiB segment limit without needing 386 protected mode or EMS drivers.
+**GB200LX translates ROM code ahead of time:**
+- **Zero Fetch/Decode Loop:** Each reachable SM83 instruction is lowered ahead of time into native 16-bit 80186 assembly with straight-line flag-liveness analysis to drop dead flag-save (`lahf`/`sahf`) sequences.
+- **Physical Register Pinning:** SM83 registers (`A`, `BC`, `DE`, `HL`, `SP`) stay pinned in 80186 hardware registers across instructions and basic blocks.
+- **Strip-Based CGA Tile-Cache Renderer:** Decodes dirty 8×8 VRAM tiles on demand into `cga_tile_cache`, composites BG (with 1-pixel `SCX & 7` fine scroll and `STAT` `LYC` HUD split), Window, and OAM sprites into an offscreen 8 KiB `backbuffer_seg`, and blits to `0xB800`.
+  - At `cycles=fixed 7910` (7.91 MHz 80186 equivalent) in DOSBox-X: *Bubble Ghost* draws in **~13.2 ms/frame** (full 60 fps, zero frameskip) and *Super Mario Land* draws in **~16.5 ms/frame**.
+- **59.73 Hz Hardware Pacing & Responsive Input:** Reprograms PIT channel 0 to 59.73 Hz (`INT 08h`, chaining the BIOS clock at 18.2 Hz) with adaptive frameskip (up to 3 skipped renders, ≥15 fps floor) and `HLT` idle sleep, plus `INT 09h` scancode hooking with per-frame joypad press latching.
+- **Relocation-Free Segmentation:** Multi-bank ROMs (up to 64 KiB / 4 banks) are split into contiguous 16-bit code segments with precomputed far-call dispatchers, requiring no EMS or protected-mode extenders.
 
 ---
 
 ## HP 200LX Hardware Overview
 
-| Specification | HP 200LX Palmtop | Recompiler Adaptation |
+| Specification | HP 200LX Palmtop | GB200LX Adaptation |
 | :--- | :--- | :--- |
 | **CPU** | Intel Hornet 80186 ASIC @ 7.91 MHz | Native 16-bit 80186 instructions only (`bits 16`, `cpu 186`) |
-| **RAM** | 636 KiB Conventional MS-DOS RAM | Entire game + RAM fits in ~292 KiB conventional memory |
-| **Display** | 320×200 4-shade grayscale LCD (CGA Mode 04h) | Centered 160×144 viewport with 4-level grayscale palette mapping |
-| **Video Memory** | `B800:0000` / `BA00:0000` (Interleaved lines) | Lookup-table accelerated scanline rendering during VBlank |
-| **Audio** | Internal piezoelectric buzzer (PIT Ch 2, Port 0x42) | Configurable PC speaker square wave tone driver |
+| **RAM** | 636 KiB Conventional MS-DOS RAM | ~240–310 KiB footprint (EXE + 64 KiB GB RAM + 8 KiB backbuffer + stack) |
+| **Display** | 320×200 4-shade grayscale LCD (CGA Mode 04h) | Centered 160×144 viewport with 4-shade palette mapping |
+| **Video Memory** | `B800:0000` / `BA00:0000` (Interleaved lines) | Dirty-cached 8-line strip rendering via offscreen backbuffer |
+| **Timer** | 8253/8254 PIT Channel 0 | Reprogrammed to 59.73 Hz (`INT 08h`, restored on exit) |
 | **OS** | ROM-based MS-DOS 5.0 | Standalone MZ `.EXE` requiring no drivers or TSRs |
 
 ---
@@ -37,57 +63,46 @@ Emulating a 4.19 MHz Game Boy CPU instruction-by-instruction via a traditional s
 
 ### 1. Pinned Hardware Register Mapping
 
-SM83 registers are pinned 1:1 into physical 80186 registers:
-
 | Game Boy (SM83) | 16-Bit x86 Register | High Half | Low Half | Notes |
 | :---: | :---: | :---: | :---: | :--- |
-| **AF** (`A`, `F`) | **`AX`** | `AL` (`A`) | `AH` (`F`) | Flags `Z N H C` packed lazily on flag-read instructions |
-| **BC** (`B`, `C`) | **`BX`** | `BH` (`B`) | `BL` (`C`) | Full 8-bit and 16-bit access |
-| **DE** (`D`, `E`) | **`DX`** | `DH` (`D`) | `DL` (`E`) | Full 8-bit and 16-bit access |
-| **HL** (`H`, `L`) | **`CX`** | `CH` (`H`) | `CL` (`L`) | Enables native 8-bit `CH`/`CL` and 16-bit `CX` arithmetic |
-| **(HL) Dereference** | **`SI`** | — | — | Loaded on demand: `mov si, cx; mov al, [si]` |
-| **SP** | **`DI`** | — | — | Game Boy stack in RAM block; hardware `SP` reserved for interrupts |
-| **Memory Space** | **`DS`** | — | — | Segment register pointing to dedicated 64 KiB Game Boy block |
-
-> [!NOTE]
-> On 16-bit x86, `SI` and `DI` cannot be split into 8-bit byte registers (`sih`/`sil` do not exist). Mapping `H` -> `CH`, `L` -> `CL`, `HL` -> `CX`, and using `SI` strictly as an address pointer provides instantaneous single-cycle 8-bit manipulation for the thousands of `H` and `L` operations in Game Boy code.
+| **A** | **`AL`** | — | `AL` (`A`) | `AH` used as scratch for flags and shifts |
+| **BC** (`B`, `C`) | **`BX`** | `BH` (`B`) | `BL` (`C`) | Native 8-bit and 16-bit access |
+| **DE** (`D`, `E`) | **`DX`** | `DH` (`D`) | `DL` (`E`) | Native 8-bit and 16-bit access |
+| **HL** (`H`, `L`) | **`CX`** | `CH` (`H`) | `CL` (`L`) | Single-instruction 8-bit `H`/`L` arithmetic |
+| **(HL) / Scratch** | **`SI`** | — | — | Loaded on demand: `mov si, cx; mov al, [si]` |
+| **SP** | **`DI`** | — | — | Game Boy stack in GB RAM; `SP` reserved for x86 calls/IRQs |
+| **Memory Base** | **`DS`** | — | — | Pinned to 64 KiB Game Boy virtual address space |
 
 ### 2. Multi-Segment Memory Layout
 
-To support Game Boy games up to 64 KiB and beyond without EMS drivers:
 ```
-+--------------------------------------------------------------+ 0000:0000
-| Segment 0: Bank 00 Code + CRT0 + Video + Config + Helpers    | (~44 KiB)
++--------------------------------------------------------------+ CS + 0x0000
+| Segment 0: Bank 00 Code + CRT0 + CGA Video + Config + Helpers| (~56-60 KiB)
 +--------------------------------------------------------------+ CS + seg1_paras
-| Segment 1: Bank 01 Recompiled Code Unit                      | (~37 KiB)
+| Segment 1: Bank 01 Recompiled Code Unit                      |
 +--------------------------------------------------------------+ CS + seg2_paras
-| Segment 2: Bank 02 Recompiled Code Unit                      | (~38 KiB)
+| Segment 2: Bank 02 Recompiled Code Unit                      |
 +--------------------------------------------------------------+ CS + seg3_paras
-| Segment 3: Bank 03 Recompiled Code Unit                      | (~37 KiB)
+| Segment 3: Bank 03 Recompiled Code Unit                      |
 +--------------------------------------------------------------+ CS + seg_rom_paras
-| Embedded Raw ROM Data (0x0000 - 0xFFFF)                      | (64 KiB)
+| Embedded Raw ROM Data (for dynamic data / tile reads)        | (32-64 KiB)
 +--------------------------------------------------------------+ gb_mem_seg
-| Game Boy 64 KiB Virtual Address Space (WRAM, VRAM, OAM, HRAM)| (64 KiB)
+| Game Boy 64 KiB Virtual Address Space (ROM/VRAM/WRAM/OAM/IO) | (64 KiB)
++--------------------------------------------------------------+ backbuffer_seg (gb_mem_seg + 1000h)
+| Offscreen CGA Compositing Backbuffer (160x144 = 5760 bytes)  | (8 KiB)
 +--------------------------------------------------------------+ SS
 | Hardware Stack Space (Allocated via DOS MZ e_minalloc)       | (32 KiB)
 +--------------------------------------------------------------+
 ```
 
-### 3. CGA Mode 04h Grayscale Pipeline
-
-The HP 200LX LCD controller maps CGA Mode 04h 2-bit pixels (`00b`, `01b`, `10b`, `11b`) to four physical shades of gray:
-- **Game Boy 2bpp Planar:** Stored in VRAM across two separate byte planes (Plane 0 at byte offset $2k$, Plane 1 at byte offset $2k+1$).
-- **CGA 2bpp Packed:** Each byte contains 4 adjacent pixels packed in pairs: `p0:p1:p2:p3`.
-- **Nibble LUT Technique:** A precalculated 256-byte table transforms an 8-pixel Game Boy slice into a 16-bit CGA word in just two memory lookups. The full $160 \times 144$ frame renders in under 1 ms.
+For full details on flag lowering, control-flow discovery, indirect writes, and the CGA pipeline, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
 ## Configuration & Keymapping
 
-GB200LX provides two configuration methods:
-
-### 1. Human-Readable INI File (`GB200LX.INI`)
-Place `GB200LX.INI` in the same directory as the executable:
+### 1. Configuration File (`GB200LX.INI`)
+Place `GB200LX.INI` in the same directory as the executable (auto-created with defaults if absent):
 ```ini
 [video]
 scaling = center          ; center (160x144 centered) or wide
@@ -107,44 +122,50 @@ key_menu   = ESC
 ```
 
 ### 2. Interactive Palmtop Setup Mode (`/SETUP`)
-Launch the recompiled game with `/SETUP` on the HP 200LX:
+Launch the recompiled binary with `/SETUP` on the HP 200LX (or `make setup` in DOSBox-X):
 ```dos
 C:\GAMES> GAME.EXE /SETUP
 ```
-Opens a lightweight, full-screen text-mode configuration utility allowing you to press any key on the palmtop keyboard to remap controls, toggle palettes, test responsiveness, and persist settings directly back to `GB200LX.INI`.
+Lets you remap controls by pressing keys directly, choose a palette preset, and save back to `GB200LX.INI`. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for all options and key names.
 
 ---
 
 ## Getting Started (Bring Your Own ROM)
 
 ### Prerequisites
-- **Python 3.8+** (for offline disassembler and code generator)
+- **Python 3.8+** (disassembler, control-flow analyzer, MZ builder)
 - **NASM 2.15+** (Netwide Assembler)
-- **DOSBox-X** (for desktop testing and verification)
+- **DOSBox-X** (optional, for desktop testing and headless verification)
 
-### Building a ROM
+### Building & Running a ROM
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/gb200lx.git
+git clone https://github.com/arnovandash/gb200lx.git
 cd gb200lx
 
-# Build standalone DOS .EXE from your own Game Boy ROM
+# Build a standalone DOS .EXE from your own .gb ROM (outputs build/GAME.EXE)
 make ROM="/path/to/your_game.gb"
 
 # Or specify a custom 8.3 DOS executable name:
 make ROM="/path/to/your_game.gb" EXE="SML.EXE"
 
-# Run automated 60-frame headless test (renders frame to build/screen.png)
-make test
+# Optional: pass RGBDS/mgbdis .sym or Mesen2 .cdl files for extra code entry seeds
+python3 tools/build_rom.py "/path/to/your_game.gb" --sym game.sym --cdl game.cdl -o GAME.EXE
 
-# Launch interactively in DOSBox-X (configured for 80186 CGA)
-make run
+# Run automated headless test in DOSBox-X (runs 120 frames, dumps build/screen.png)
+make test ROM="/path/to/your_game.gb"
 
-# Launch interactive setup wizard
+# Launch interactively in DOSBox-X (configured for 80186 + CGA)
+make run ROM="/path/to/your_game.gb"
+
+# Launch interactive /SETUP wizard
 make setup
 ```
 
-The resulting `build/GAME.EXE` and `GB200LX.INI` can be copied directly to your HP 200LX CompactFlash card or RAM disk (`A:\` or `C:\`) and launched natively under MS-DOS.
+> [!TIP]
+> If `<rom_stem>.sym` or `<rom_stem>.cdl` sits alongside your `.gb` file, `tools/build_rom.py` automatically loads it for additional indirect jump/call entry seeds.
+
+Copy `build/GAME.EXE` (and optionally `GB200LX.INI`) to your HP 200LX CF card or RAM disk and run it under MS-DOS.
 
 ---
 
@@ -152,25 +173,26 @@ The resulting `build/GAME.EXE` and `GB200LX.INI` can be copied directly to your 
 
 ```
 gb200lx/
-├── codegen_80186/          # Offline SM83 to 80186 recompiler
-│   └── recompiler_80186.py # Disassembler, CFG analysis, x86-16 emitter
+├── codegen_80186/          # Offline SM83 to 80186 static recompiler
+│   └── recompiler_80186.py # SM83 disassembler & flag-aware x86-16 code generator
 ├── runtime/                # 16-bit NASM runtime routines
-│   ├── crt0_rom.asm        # Standalone ROM harness, frame scheduler & INT 09h hook
-│   ├── crt0.asm            # Generic bring-up skeleton
-│   ├── video_cga.asm       # CGA Mode 04h driver & PPU dirty frame blitter
-│   ├── video_cga.inc       # Video constants and macros
-│   ├── config_ini.asm      # INI parser and text-mode /SETUP wizard
-│   ├── config_ini.inc      # Configuration structure definitions
-│   └── recomp_helpers.asm  # Bank switching, DMA, and memory routing helpers
-├── tools/                  # Build automation & diagnostics
-│   ├── build_rom.py        # Generic multi-segment AOT compiler & linker
-│   ├── mzpack.py           # MS-DOS MZ header synthesis tool
+│   ├── crt0_rom.asm        # ROM startup, 59.73 Hz INT 08h timer & INT 09h hook
+│   ├── crt0.asm            # Early video bring-up test harness
+│   ├── video_cga.asm       # CGA Mode 04h driver, tile cache, strip BG/Win/OAM renderer
+│   ├── video_cga.inc       # Video constants
+│   ├── config_ini.asm      # GB200LX.INI parser and text-mode /SETUP wizard
+│   ├── config_ini.inc      # Configuration structure offsets & constants
+│   └── recomp_helpers.asm  # Bank switching, DMA, MMIO, HALT pacing & far bridges
+├── tools/                  # Build orchestration & MS-DOS packaging
+│   ├── build_rom.py        # Multi-segment CFG analyzer, 2-pass builder & .sym/.cdl loader
+│   ├── mzpack.py           # MS-DOS MZ header packager
 │   └── cga_to_png.py       # CGA Mode 04h VRAM dump to PNG converter
-├── docs/                   # In-depth architectural documentation
-│   ├── ARCHITECTURE.md     # Register pinning, segmentation & memory routing
-│   └── CONFIGURATION.md    # Key codes, palette presets & INI guide
-├── dosbox-x.conf           # 80186 + CGA test configuration
-├── Makefile                # Bring-your-own-ROM build and test orchestration
+├── docs/                   # Documentation & screenshots
+│   ├── ARCHITECTURE.md     # Register pinning, CFG recovery, segmentation & CGA pipeline
+│   ├── CONFIGURATION.md    # Key codes, palette presets & INI reference
+│   └── screenshots/        # DOSBox-X gameplay captures
+├── dosbox-x.conf           # 80186 + CGA DOSBox-X test configuration
+├── Makefile                # Bring-Your-Own-ROM build & test targets
 ├── GB200LX.INI             # Default user configuration
 └── README.md
 ```

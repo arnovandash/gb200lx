@@ -1,152 +1,115 @@
 # GB200LX Technical Architecture & Design Specification
 
-This document details the internal design and architectural decisions of **GB200LX**, an ahead-of-time (AOT) static recompiler targeting 16-bit 80186 MS-DOS on the HP 200LX palmtop.
+This document describes the internal design of **GB200LX**, an ahead-of-time (AOT) static recompiler targeting 16-bit 80186 MS-DOS on the HP 200LX palmtop.
 
 ---
 
-## 1. Problem Formulation: The 80186 Constraint
+## 1. The 80186 Target Constraints
 
-The HP 200LX palmtop runs an **Intel Hornet 80186 ASIC** clocked at 7.91 MHz.
-Key characteristics of this platform include:
-- **16-Bit Real Mode Only:** No 32-bit registers (`EAX`, `EBX`, etc.) and no 386 protected mode.
-- **Strict 64 KiB Segment Limits:** Code and data segments cannot exceed 65,536 bytes without changing segment registers (`CS`, `DS`, `ES`, `SS`).
-- **Clock Budget:** At 7.91 MHz, the CPU delivers approximately 1.5–2.0 MIPS (averaging 4–5 clock cycles per x86 instruction).
-- **Game Boy Clock Rate:** The Game Boy SM83 CPU runs at 4.194304 MHz (1.05 M-cycles/second).
+The HP 200LX runs an **Intel Hornet 80186 ASIC** at 7.91 MHz:
+- **16-Bit Real Mode Only:** No 32-bit registers and no 386 protected mode.
+- **64 KiB Segment Limit:** Each code/data segment (`CS`, `DS`, `ES`, `SS`) addresses 65,536 bytes; multi-bank Game Boy code must be split across segments.
+- **No Traditional Emulator Budget:** Fetching, decoding, and updating virtual registers in software leaves only a handful of FPS at 7.91 MHz.
 
-An interpreter executing 4–8 x86 instructions to fetch an opcode, update a cycle counter, index a jump table, read memory structs, and compute flags would consume 30–60 clock cycles per Game Boy opcode. At 7.91 MHz, this yields at best 5–10 FPS.
-
-**The Solution:** Ahead-of-time static translation of SM83 instructions into native 16-bit x86 instructions, matching physical registers 1:1, resolving addresses statically, and blitting video frames during VBlank with lookup tables.
+**Approach:** Static SM83-to-80186 translation, physical register pinning, multi-segment far trampolines, dirty-cached strip rendering to CGA Mode 04h, and 59.73 Hz PIT interrupt pacing.
 
 ---
 
 ## 2. Register Pinning Strategy
 
-### The 16-Bit x86 Register Dilemma
-The 80186 provides eight general-purpose 16-bit registers:
-`AX`, `BX`, `CX`, `DX`, `SI`, `DI`, `BP`, `SP`.
-
-Of these, **only four** can be split into 8-bit high/low halves:
-- `AX` -> `AH`, `AL`
-- `BX` -> `BH`, `BL`
-- `CX` -> `CH`, `CL`
-- `DX` -> `DH`, `DL`
-
-Crucially, **`SI`, `DI`, `BP`, and `SP` have no 8-bit halves**.
-
-Game Boy code frequently accesses 8-bit registers (`LD A, H`, `INC L`, `ADD A, C`, `DEC B`). If `H` and `L` were mapped to `SI` (e.g. `SI` as `HL`), every 8-bit read or write to `H` or `L` would require shifting and masking `SI` through a temporary register, costing 8–12 cycles per operation.
-
-### The Unified Mapping Solution
+Only four 80186 registers (`AX`, `BX`, `CX`, `DX`) can be split into high/low 8-bit halves, while `SI`, `DI`, `BP`, and `SP` are 16-bit only. Mapping `HL` to `CX` (`CH`/`CL`) avoids bit-shifting on every 8-bit `H`/`L` instruction while keeping `SI` ready for 1-instruction `(HL)` dereferencing (`mov si, cx`):
 
 | SM83 Register | 80186 Register | High Half | Low Half | Purpose |
 | :---: | :---: | :---: | :---: | :--- |
-| **`AF`** | **`AX`** | `AH` (`F`) | `AL` (`A`) | Accumulator & lazy flags |
+| **`A`** | **`AL`** | — | `AL` (`A`) | Accumulator (`AH` is scratch for flags/helpers) |
 | **`BC`** | **`BX`** | `BH` (`B`) | `BL` (`C`) | 8-bit counters & 16-bit base |
 | **`DE`** | **`DX`** | `DH` (`D`) | `DL` (`E`) | 8-bit data & 16-bit displacement |
-| **`HL`** | **`CX`** | `CH` (`H`) | `CL` (`L`) | High-speed 8-bit & 16-bit arithmetic |
-| **`(HL)` Pointer** | **`SI`** | — | — | Loaded on demand: `mov si, cx; mov al, [si]` |
-| **`SP`** | **`DI`** | — | — | Game Boy stack pointer in GB RAM segment |
-| **Hardware `SP`**| **`SP`** | — | — | Reserved strictly for native x86 `CALL`/`RET` and interrupts |
-| **Memory Base**  | **`DS`** | — | — | Pinned to dedicated 64 KiB Game Boy memory segment |
-
-By assigning `HL` to `CX`, all 8-bit operations on `H` (`CH`) and `L` (`CL`) execute as single-cycle native instructions (`inc ch`, `mov al, cl`, etc.). Whenever `(HL)` memory dereferencing is required, `mov si, cx` executes in 2 clock cycles before accessing `[si]`.
-
----
-
-## 3. Memory Routing & Address Virtualization
-
-A dedicated, paragraph-aligned 64 KiB block in conventional RAM is assigned to the Game Boy address space (`0x0000..0xFFFF`), with `DS` permanently pointing to this segment during game execution.
-
-### Memory Map Fast Paths
-```
-0x0000 - 0x3FFF: ROM Bank 00    -> Read-only; mapped to lower 16 KiB of DS block
-0x4000 - 0x7FFF: ROM Bank NN    -> Bank-switched; updated by helper_write_mbc
-0x8000 - 0x9FFF: VRAM           -> Direct reads/writes in DS block
-0xC000 - 0xDFFF: WRAM           -> Direct reads/writes in DS block
-0xE000 - 0xFDFF: Echo RAM       -> Mirrored to WRAM
-0xFE00 - 0xFE9F: OAM            -> Direct reads/writes in DS block
-0xFF00 - 0xFF7F: MMIO Registers -> Intercepted via helpers (LCDC, LY, DMA, JOYP)
-0xFF80 - 0xFFFE: HRAM           -> Direct reads/writes in DS block
-0xFFFF         : IE Register    -> Direct access in DS block
-```
-
-### Direct vs. Range-Checked Memory Access
-1. **Statically Resolved Addresses:**
-   When the target address is known at translation time:
-   - WRAM (`0xC000..0xFDFF`): `mov [0C120h], al` (direct native write, 0 overhead).
-   - HRAM (`0xFF80..0xFFFE`): `mov [0FF85h], al` (direct native write).
-   - MMIO Registers: `mov [0FF40h], al; mov bp, 0FF40h; call helper_write_mmio`.
-2. **Dynamic Pointer Writes (`LD (HL), A`):**
-   ```nasm
-   mov     si, cx
-   call    helper_write_hl
-   ```
-   Inside `helper_write_hl`:
-   ```nasm
-   helper_write_hl:
-       cmp     si, 08000h
-       jb      short .hl_mbc       ; Writes < 0x8000 trigger MBC bank switching
-       cmp     si, 0FE00h
-       jae     short .hl_mmio      ; Writes >= 0xFE00 check OAM/MMIO side-effects
-       mov     [si], al            ; Fast path: WRAM/VRAM write directly inline
-       ret
-   ```
+| **`HL`** | **`CX`** | `CH` (`H`) | `CL` (`L`) | Fast 8-bit `H`/`L` and 16-bit `HL` ops |
+| **`(HL)` / Scratch** | **`SI`** | — | — | Loaded on demand before `[si]` access |
+| **`SP`** | **`DI`** | — | — | Game Boy stack inside `DS` (`lea di, [di +/- 2]`) |
+| **MMIO / Scratch** | **`BP`** | — | — | Target address for helpers; note `[ds:bp]` required since `[bp]` defaults to `SS` |
+| **Hardware `SP`** | **`SP`** | — | — | Strictly reserved for native 80186 `CALL`/`RET` and PC IRQs |
+| **Memory Base** | **`DS`** | — | — | Pinned to dedicated 64 KiB Game Boy memory block (`gb_mem_seg`) |
 
 ---
 
-## 4. Multi-Segment Architecture & Cross-Bank Dispatch
+## 3. Instruction Lowering & Flag Semantics
 
-Game Boy titles with bank switching (MBC1) contain multiple 16 KiB ROM banks. Super Mario Land contains 4 banks (64 KiB total).
+In [codegen_80186/recompiler_80186.py](codegen_80186/recompiler_80186.py):
+- **Flag Preservation:**
+  - `INC`/`DEC rr` preserves `ZF` and `CF`: uses `lea` for `BX`/`DI` and `lahf`/`sahf` for `CX`/`DX`.
+  - `PUSH`/`POP rr`, `CALL`, and `RET` update `DI` with `lea di, [di +/- 2]` so hardware flags survive calls and returns.
+  - `ADD HL, rr` preserves `ZF` while updating `CF` (`lahf; and ah, 0FEh; add cx, rr; adc ah, 0; sahf`).
+  - `BIT b, r` preserves `CF` while updating `ZF` (`lahf; test ...; rcr ah, 1`).
+  - CB-prefixed rotates (`RLC`, `RRC`, `RL`, `RR`) update both `CF` and `ZF`.
+  - `LDI`/`LDD` advance `HL` via `lea cx, [si +/- 1]` so flags are untouched.
+- **Decimal Adjust (`DAA` / `DAS`):** The translator tracks `last_alu_sub` across `ADD`/`ADC`/`INC A` vs. `SUB`/`SBC`/`DEC A`, emitting x86 `das` after subtractions and `daa` after additions.
+- **Conservative Flag-Liveness Optimization:** `flags_dead_after()` in [tools/build_rom.py](tools/build_rom.py) scans straight-line instructions ahead (up to 16 instructions, stopping at any branch target, control transfer, or flag reader). If a full flag redefinition (`ADD`, `SUB`, `AND`, `OR`, `XOR`, `CP`, shifts, `POP AF`) is guaranteed before any flag read, the preceding `lahf`/`sahf` or `rcr ah, 1` flag-fixup sequence is omitted.
+- **Native `PUSH AF` / `POP AF`:** `helper_push_af` and `helper_pop_af` pack/unpack SM83 flags `Z N H C` (`F` bits 7..4) to/from 80186 `FLAGS`.
 
-### Contiguous Segment Offsets
-Each 16 KiB bank is translated as an independent code segment assembled with `org 0`. During pass 1 of the build pipeline, segment sizes are measured and padded to 16-byte paragraph boundaries:
-- Segment 0: `CS + 0`
-- Segment 1: `CS + SEG1_PARAS_VAL`
-- Segment 2: `CS + SEG2_PARAS_VAL`
-- Segment 3: `CS + SEG3_PARAS_VAL`
-- Raw ROM Data: `CS + SEG_ROM_PARAS_VAL`
+---
 
-Because segment bases are contiguous relative to the program's initial code segment `CS`, any segment can compute the segment base of another at runtime without link-time relocations:
-```nasm
-; From Bank 1, call Bank 0 wrapper:
-mov     ax, cs
-sub     ax, SEG1_PARAS_VAL          ; AX = Segment 0 base
-push    ax                          ; Push far segment
-push    word (4 + target_idx * 4)   ; Push far offset
-mov     bp, sp
-call    far [bp]                    ; Execute far call
-add     sp, 4
-ret
+## 4. Control-Flow Discovery & Multi-Segment Build
+
+[tools/build_rom.py](tools/build_rom.py) performs recursive control-flow recovery across up to 4 × 16 KiB ROM banks before disassembly/emission:
+- **Seed Sources:**
+  - Cartridge entry (`0x0100`) and interrupt vectors (`0x0040`, `0x0048`, `0x0050`, `0x0058`, `0x0060`) plus reachable `RST` vectors.
+  - Optional RGBDS/`mgbdis` `.sym` (`--sym`) and Mesen2 `.cdl` (`--cdl`) seeds (also auto-detected alongside the ROM by stem).
+  - Automatic detection of `RST` jump-table dispatchers (e.g., `RST 0x28`), inline `JP (HL)` word tables, synthetic `LD rr, imm16; PUSH rr` return-address idioms, and HRAM OAM-DMA copy routines (re-routed to native `helper_dma_transfer`).
+  - Automatic `helper_halt` yield insertion on 3-instruction `LDH/LD A, (RAM); AND/OR A, A; JR Z, start` busy-wait spin loops.
+- **Label Resynchronization:** Any instruction that would overlap an interior branch target is split into raw bytes (`db`) so disassembly stays aligned at every discovered entry point.
+- **Two-Pass Relocation-Free Segmentation:**
+  1. **Bank 0 (`seg0`):** Holds `crt0_rom.asm`, `video_cga.asm`, `config_ini.asm`, `recomp_helpers.asm`, recompiled Bank 0 code, `b0_helper_table` at fixed offsets `0004h..0020h`, and `b0_entry_table` starting at `0024h`.
+  2. **Banks 1–3 (`seg1..seg3`):** Each bank is assembled with `org 0`, starting with a `dispatch_bN` jump table (4 bytes per entry).
+  3. **Pass 1 / Pass 2:** Pass 1 measures exact segment paragraph sizes (`SEG1_PARAS_VAL`, `SEG2_PARAS_VAL`, `SEG3_PARAS_VAL`, `SEG_ROM_PARAS_VAL`), then Pass 2 re-assembles with exact segment deltas and packs `build/GAME.BIN` -> `build/GAME.EXE` via [tools/mzpack.py](tools/mzpack.py).
+
+---
+
+## 5. Memory Map & Runtime Routing
+
+`tools/mzpack.py` reserves `gb_ram_paras = 0x1200` (72 KiB) right after the embedded ROM image:
+- `gb_mem_seg` (`64 KiB`): Game Boy virtual address space `0x0000..0xFFFF` pinned in `DS`.
+- `backbuffer_seg` (`gb_mem_seg + 1000h`, `8 KiB`): Offscreen `160×144` CGA compositing buffer (`5760` bytes used).
+
+```
+0x0000 - 0x3FFF : ROM Bank 00
+0x4000 - 0x7FFF : Switchable ROM Bank 01..03 (updated via helper_write_mbc)
+0x8000 - 0x97FF : VRAM Tile Data (writes through helpers flag tile_dirty[0..383])
+0x9800 - 0x9FFF : VRAM Tile Maps
+0xA000 - 0xFDFF : External RAM / WRAM / Echo RAM
+0xFE00 - 0xFE9F : OAM Sprite Attribute Table
+0xFF00 - 0xFF7F : MMIO Registers (JOYP, DIV, LY, DMA, BGP, LCDC, SCY/SCX, etc.)
+0xFF80 - 0xFFFE : High RAM (HRAM)
+0xFFFF          : Interrupt Enable (IE)
 ```
 
-### Relocation-Free Jump Tables
-- **Bank 0 -> Bank N:** Target wrappers in Bank N are positioned at fixed offsets: $k \times 4$.
-- **Bank N -> Bank 0:** Bank 0 provides an aligned entry jump table starting at offset 4 (immediately after the 3-byte entry trampoline `jmp near entry; nop`).
+- **Direct Static Writes:** Constant writes to WRAM/HRAM compile directly to `mov [0NNNNh], al`; constant MMIO writes call `helper_write_mmio`, `helper_update_bgp`, `helper_dma_transfer`, or `helper_write_mbc`.
+- **Dynamic Pointer Writes (`helper_write_hl/bc/de`):** A fast path checks `(addr - 0xA000) < 0x5E00` using `lahf`/`sahf` (no `pushf`/`popf`) and writes straight to RAM (`0xA000..0xFDFF`), falling back to MBC/VRAM-dirty/MMIO handling only outside that range.
 
 ---
 
-## 5. CGA Mode 04h Grayscale Pipeline
+## 6. CGA Mode 04h PPU Pipeline
 
-### Planar to Packed Nibble Conversion
-The Game Boy PPU stores 2-bit pixels in planar format (two bytes per 8-pixel row):
-- Byte 0: `p7_0 p6_0 p5_0 p4_0 p3_0 p2_0 p1_0 p0_0` (Bitplane 0)
-- Byte 1: `p7_1 p6_1 p5_1 p4_1 p3_1 p2_1 p1_1 p0_1` (Bitplane 1)
-
-CGA Mode 04h requires packed pixels: 4 pixels per byte:
-- Byte: `p0:p1:p2:p3` (each pixel is 2 bits).
-
-GB200LX implements an ultra-fast 256-byte lookup table (`dmg_cga_nibble_table`). For any 4-pixel nybble formed by combining 4 bits of Bitplane 0 and 4 bits of Bitplane 1 into an index, the table directly returns the 8-bit packed CGA representation.
-
-An entire 8-pixel row is converted using:
-1. Low nibbles combined -> Table lookup -> Left CGA byte.
-2. High nibbles combined -> Table lookup -> Right CGA byte.
-
-Rendering all 144 scanlines requires less than 72,000 CPU cycles per frame, leaving **>98% of Hornet CPU bandwidth** dedicated to running game logic.
+Implemented in [runtime/video_cga.asm](runtime/video_cga.asm):
+1. **Nibble Palette LUT & Dirty Tile Cache:**
+   - On `BGP` (`0xFF47`) changes, `helper_update_bgp` rebuilds `dmg_cga_nibble_table` (256 bytes) and marks all 384 VRAM tiles dirty.
+   - `update_cga_tile_cache` scans `tile_dirty[384]` (`repe scasb`) and pre-decodes only modified tiles into `CS:cga_tile_cache` (6,144 bytes = 384 × 8 rows × 2 CGA bytes).
+2. **8-Line Strip Rendering & `STAT` `LYC` Split:**
+   - Precomputes `render_split_limit` (`LYC + 1` when `IE` bit 1 and `0 < LYC < 144` are enabled) to preserve split-scroll HUDs (using `hud_scy`/`hud_scx` captured right after VBlank).
+   - Processes Background in strips of `1..8` scanlines that never cross a tile row (`(Y + SCY) & 7`) or `render_split_limit`.
+   - When `SCX & 7 == 0`, `render_aligned_strip` looks up each tile once per strip and copies all strip rows straight into `backbuffer_seg`.
+   - When `SCX & 7 != 0`, 21 tiles × strip height are written into `CS:cga_strip_buf` (stride 44) once per strip, then fast-copied (`rep movsw` for `fine_x == 4`) or shifted with `DS = CS` (`lodsb`/`lodsw`/`stosw`).
+3. **Window Layer:** Uses `render_aligned_strip` with `cga_tile_cache` from `WY`/`WX` downward.
+4. **OAM Sprites (40 entries, 8×8 or 8×16):**
+   - Rendered back-to-front (`39 -> 0`) with precomputed 3-shade palette per visible sprite, immediate empty-row skipping (`test ax, ax; jz`), `shl`/`shr` + `adc` pixel extraction, table-driven CGA masking, and OAM attribute bit 7 (OBJ-behind-BG-colors-1..3).
+5. **Backbuffer Blit:** Copies the 144 composited 40-byte scanlines from `backbuffer_seg` to interleaved CGA VRAM `0xB800` via `cga_scanline_offsets`.
 
 ---
 
-## 6. Interrupt & Frame Pacing
+## 7. Frame Pacing & Keyboard Input
 
-1. **VBlank Synchronization:**
-   When the Game Boy code executes `HALT`, the CPU sleeps waiting for the VBlank interrupt. In GB200LX, `helper_halt` intercepts this call, renders the CGA frame, checks input/exit flags, and dispatches the Game Boy VBlank ISR vector at `loc_00_0040`.
-2. **Keyboard Interception:**
-   `INT 09h` (Keyboard Hardware IRQ1) is hooked at startup. Scancodes are matched against the user's keymappings loaded from `GB200LX.INI` and update the active Game Boy joypad register state in real time. Upon exit, the original BIOS vector is cleanly restored.
+- **59.73 Hz Frame Clock (`runtime/crt0_rom.asm` & `runtime/recomp_helpers.asm`):**
+  - `hook_int08` reprograms PIT channel 0 to divisor `19977` (`1193182 / 19977 ≈ 59.73 Hz`), incrementing `frame_ticks` on each tick and chaining the original BIOS `INT 08h` handler at the average 18.2 Hz overflow rate so the DOS clock stays accurate. Original PIT divisor and `INT 08h` vector are restored on exit.
+  - `helper_halt` sleeps with `sti; hlt` when ahead of schedule, enforces `1` Game Boy logic frame + VBlank/STAT/Timer ISR dispatch per tick, and skips `cga_render_gb_frame` when `frame_ticks > 0` up to `MAX_FRAME_SKIP` (`3`) consecutive frames (dropping excess ticks past `MAX_FRAME_BACKLOG = 6`).
+- **Low-Latency Input (`int09_handler` & `helper_read_joyp`):**
+  - Intercepts IRQ1 scancodes (`in al, 60h`), acknowledges `0xE0` extended prefixes cleanly so arrow keys work reliably, and updates live `joypad_dir`/`joypad_act` bitmasks plus per-frame `joypad_dir_latch`/`joypad_act_latch` bytes (reset in `helper_halt`) so brief taps occurring mid-frame are still observed on the next `helper_read_joyp`.
