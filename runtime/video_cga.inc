@@ -5,6 +5,7 @@
 
 CGA_VRAM_SEG        equ 0B800h      ; Video RAM segment for CGA mode 04h
 CGA_ODD_OFFSET      equ 2000h       ; Offset to odd scanline bank in CGA VRAM
+CGA_STATUS_REG      equ 03DAh       ; CGA CRT status register (bit 3 = VRetrace)
 
 CGA_SCREEN_WIDTH    equ 320         ; Screen width in pixels
 CGA_SCREEN_HEIGHT   equ 200         ; Screen height in scanlines

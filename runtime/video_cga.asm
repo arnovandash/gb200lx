@@ -20,12 +20,8 @@ cga_init:
     mov     ax, 0004h
     int     10h
 
-    ; Optional: select CGA palette 0 (0=Black/Green/Red/Brown) or palette 1 (Black/Cyan/Magenta/White)
-    ; On the HP 200LX LCD, colors 0-3 map directly to 4 physical gray levels.
-    mov     ah, 0Bh
-    mov     bh, 01h     ; Subfunction 1: select palette
-    mov     bl, 00h     ; Palette 0
-    int     10h
+    ; Apply configured CGA hardware palette & background color
+    call    cga_sync_hw_palette
 
     ; Initialize precomputed scanline offset lookup table
     call    cga_blit_scanline_table_init
@@ -34,6 +30,33 @@ cga_init:
     call    cga_clear_screen
 
     pop     bp
+    ret
+
+; ------------------------------------------------------------------------------
+; cga_sync_hw_palette: Program BIOS CGA palette (INT 10h AH=0Bh) for cfg_palette
+; ------------------------------------------------------------------------------
+global cga_sync_hw_palette
+cga_sync_hw_palette:
+    push    ax
+    push    bx
+    mov     ax, 0B00h
+    mov     bx, 0101h               ; Palette 1 (Cyan/Magenta/White)
+    xor     al, al                  ; Background/Border = Black (00h)
+    cmp     byte [cs:cfg_palette], PAL_DMG
+    jne     .set_pal
+    mov     bl, 00h                 ; DMG: Palette 0 (Green/Red/Brown)
+    mov     al, 02h                 ; DMG: Green background (02h)
+.set_pal:
+    push    ax
+    mov     ah, 0Bh
+    int     10h                     ; Set Palette ID (BH=01h, BL=0/1)
+    pop     ax
+    mov     bl, al
+    xor     bh, bh
+    mov     ah, 0Bh
+    int     10h                     ; Set Background/Border color (BH=00h, BL=0/2)
+    pop     bx
+    pop     ax
     ret
 
 ; ------------------------------------------------------------------------------
@@ -53,7 +76,7 @@ cga_restore_text:
     ret
 
 ; ------------------------------------------------------------------------------
-; cga_clear_screen: Clears both even and odd CGA VRAM fields to 0 (White/Blank)
+; cga_clear_screen: Clears both even and odd CGA VRAM fields to [cs:cfg_shade0]
 ; Input:  None
 ; Output: None
 ; Clobbers: AX, CX, ES, DI
@@ -65,14 +88,15 @@ cga_clear_screen:
     mov     ax, CGA_VRAM_SEG
     mov     es, ax
 
-    ; Clear even scanline field (lines 0, 2, ..., 198: 100 lines * 80 bytes = 8000 bytes = 4000 words)
+    ; Fill even scanline field (4000 words) with paper shade (00h or FFh in Dark mode)
     xor     di, di
-    xor     ax, ax
+    mov     al, [cs:cfg_shade0]
+    mov     ah, al
     mov     cx, 4000
     cld
     rep     stosw
 
-    ; Clear odd scanline field (lines 1, 3, ..., 199: starts at 2000h)
+    ; Fill odd scanline field (starts at 2000h)
     mov     di, CGA_ODD_OFFSET
     mov     cx, 4000
     rep     stosw
@@ -136,7 +160,7 @@ cga_blit_scanline_table_init:
 ; Margins: x = 79..240, y = 27..172
 ; ------------------------------------------------------------------------------
 cga_draw_border:
-    cmp     byte [cfg_border], 0
+    cmp     byte [cs:cfg_border], 0
     jne     .border_enabled
     ret
 .border_enabled:
@@ -149,36 +173,58 @@ cga_draw_border:
 
     mov     ax, CGA_VRAM_SEG
     mov     es, ax
-
-    ; Top border line: Screen line 27 (odd line, k=13)
-    ; k = 13: 13 * 80 = 1040. 2000h + 1040 + 20 = 2430h
-    mov     di, CGA_ODD_OFFSET + (13 * CGA_BYTES_PER_LINE) + GB_OFFSET_X_BYTES
-    mov     al, [cfg_shade3]
-    mov     cx, GB_BYTES_PER_LINE
     cld
-    rep     stosb
 
-    ; Bottom border line: Screen line 172 (even line, k=86)
-    ; k = 86: 86 * 80 = 6880 = 1AE0h. 1AE0h + 20 = 1AF4h
-    mov     di, (86 * CGA_BYTES_PER_LINE) + GB_OFFSET_X_BYTES
-    mov     al, [cfg_shade3]
+    cmp     byte [cs:cfg_scaling], SCALE_WIDE
+    je      .border_wide
+
+    ; Centered 160x144 border: Top y=27 (40 bytes), Bottom y=172 (40 bytes)
+    mov     di, CGA_ODD_OFFSET + (13 * CGA_BYTES_PER_LINE) + GB_OFFSET_X_BYTES
+    mov     al, [cs:cfg_shade3]
     mov     cx, GB_BYTES_PER_LINE
     rep     stosb
 
-    ; Left and right vertical borders: lines 28 through 171
+    mov     di, (86 * CGA_BYTES_PER_LINE) + GB_OFFSET_X_BYTES
+    mov     cx, GB_BYTES_PER_LINE
+    rep     stosb
+
+    ; Left & right vertical edges on scanlines 28..171 (preserve outer paper shade)
+    mov     al, [cs:cfg_shade0]
+    and     al, 11111100b
+    mov     dl, [cs:cfg_shade3]
+    and     dl, 00000011b
+    or      al, dl                  ; Left edge byte
+
+    mov     ah, [cs:cfg_shade0]
+    and     ah, 00111111b
+    mov     dl, [cs:cfg_shade3]
+    and     dl, 11000000b
+    or      ah, dl                  ; Right edge byte
+
     xor     cx, cx                  ; y = 0..143
 .vert_loop:
     mov     bx, cx
     shl     bx, 1
-    mov     di, [cga_scanline_offsets + bx]
-    ; Left pixel of viewport: write left edge byte
-    ; In CGA 2bpp, pixel 0 is bits 7-6. Set bits 7-6 to black (11000000b) or full border byte
-    mov     byte [es:di - 1], 00000011b   ; Pixel right next to viewport
-    mov     byte [es:di + GB_BYTES_PER_LINE], 11000000b ; Pixel right after viewport
+    mov     di, [cs:cga_scanline_offsets + bx]
+    mov     [es:di - 1], al
+    mov     [es:di + GB_BYTES_PER_LINE], ah
     inc     cx
     cmp     cx, GB_SCREEN_HEIGHT
     jb      .vert_loop
+    jmp     short .border_done
 
+.border_wide:
+    ; Wide 320x144 border: Top y=27 (80 bytes), Bottom y=172 (80 bytes)
+    mov     al, [cs:cfg_shade3]
+    mov     di, CGA_ODD_OFFSET + (13 * CGA_BYTES_PER_LINE)
+    mov     cx, CGA_BYTES_PER_LINE
+    rep     stosb
+
+    mov     di, 86 * CGA_BYTES_PER_LINE
+    mov     cx, CGA_BYTES_PER_LINE
+    rep     stosb
+
+.border_done:
     pop     es
     pop     di
     pop     dx
@@ -1089,7 +1135,19 @@ cga_render_gb_frame:
     jnz     near .spr_loop
 
 .blit_backbuffer:
-    ; Blit completed 160x144 composited frame from backbuffer_seg to CGA VRAM (0xB800)
+    ; Optional CGA vertical retrace sync (cfg_vsync == 1) with bounded safety timeout
+    cmp     byte [cs:cfg_vsync], 0
+    je      .vsync_done
+    mov     dx, CGA_STATUS_REG
+    mov     cx, 4000
+.vsync_wait:
+    in      al, dx
+    test    al, 08h
+    jnz     .vsync_done
+    loop    .vsync_wait
+.vsync_done:
+
+    ; Blit completed composited frame from backbuffer_seg to CGA VRAM (0xB800)
     push    ds
     mov     ax, CGA_VRAM_SEG
     mov     es, ax
@@ -1097,8 +1155,11 @@ cga_render_gb_frame:
     mov     ds, ax
 
     xor     si, si
-    xor     bx, bx              ; BX = scanline index (0..143) * 2
     cld
+    cmp     byte [cs:cfg_scaling], SCALE_WIDE
+    je      .blit_wide
+
+    xor     bx, bx              ; BX = scanline index (0..143) * 2
 .blit_line_loop:
     mov     di, [cs:cga_scanline_offsets + bx]
     mov     cx, (GB_BYTES_PER_LINE / 2) ; 20 words = 40 bytes
@@ -1106,7 +1167,31 @@ cga_render_gb_frame:
     add     bx, 2
     cmp     bx, GB_SCREEN_HEIGHT * 2
     jb      .blit_line_loop
+    jmp     short .blit_done
 
+.blit_wide:
+    xor     dx, dx              ; DX = scanline index (0..143) * 2
+.blit_wide_line:
+    mov     bx, dx
+    mov     di, [cs:cga_scanline_offsets + bx]
+    sub     di, GB_OFFSET_X_BYTES ; Full-width column 0
+    mov     cx, 10              ; 10 * 4 = 40 src bytes -> 80 dst bytes (320 px)
+.blit_wide_quad:
+%rep 4
+    lodsb
+    mov     bl, al
+    xor     bh, bh
+    add     bx, bx
+    mov     ax, [cs:cga_wide_table + bx]
+    stosw
+%endrep
+    dec     cx
+    jnz     .blit_wide_quad
+    add     dx, 2
+    cmp     dx, GB_SCREEN_HEIGHT * 2
+    jb      .blit_wide_line
+
+.blit_done:
     pop     ds
 
 .render_done:
@@ -1380,4 +1465,18 @@ render_run_lines:       db 0
 render_row_cnt:         db 0
 render_y:               dw 0
 render_dest_di:         dw 0
+    align 2
+cga_wide_table:
+%assign _wb 0
+%rep 256
+    %assign _p0 ((_wb >> 6) & 3)
+    %assign _p1 ((_wb >> 4) & 3)
+    %assign _p2 ((_wb >> 2) & 3)
+    %assign _p3 (_wb & 3)
+    %assign _lo ((_p0 * 0x50) | (_p1 * 0x05))
+    %assign _hi ((_p2 * 0x50) | (_p3 * 0x05))
+    dw ((_hi << 8) | _lo)
+    %assign _wb _wb+1
+%endrep
+
 cga_strip_buf:          times (8 * 44) db 0

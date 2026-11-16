@@ -39,19 +39,19 @@ key_menu = ESC
 
 | Parameter | Options | Default | Notes |
 | :--- | :--- | :--- | :--- |
-| **`palette`** | `pocket`, `dmg`, `high_con`, `dark` | `pocket` | Selects the 4-shade CGA grayscale mapping (`cfg_shade0..3`). |
-| **`scaling`** | `center`, `wide` | `center` | Stored in INI and `/SETUP` (`center` = 160×144 viewport centered at `(80, 28)`). |
-| **`vsync`** | `1`, `0` | `1` | Kept for INI compatibility; frame pacing is governed by the 59.73 Hz PIT `INT 08h` clock. |
+| **`palette`** | `pocket`, `dmg`, `high_con`, `dark` | `pocket` | Selects the 4-shade CGA grayscale mapping (`cfg_shade0..3`) and BIOS CGA palette. |
+| **`scaling`** | `center`, `wide` | `center` | `center` = 160×144 centered at `(80, 28)`; `wide` = 2× horizontal stretch (`320×144`). |
+| **`vsync`** | `1`, `0` | `1` | Waits for CGA vertical retrace (`0x03DA` bit 3) before blitting when `1`. |
 | **`sound`** | `1`, `0` | `1` | Enables (`1`) or mutes (`0`) PC speaker APU synthesis on PIT Channel 2. |
 
 #### Palette Presets
 
 | Palette | Shade 0 | Shade 1 | Shade 2 | Shade 3 | Notes |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`pocket`** | White (`00b`) | Light Gray (`01b`) | Dark Gray (`10b`) | Black (`11b`) | Crisp 4-shade mapping (default) |
-| **`dmg`** | White (`00b`) | Light Gray (`01b`) | Dark Gray (`10b`) | Black (`11b`) | Classic 4-shade mapping |
+| **`pocket`** | White (`00b`) | Light Gray (`01b`) | Dark Gray (`10b`) | Black (`11b`) | Crisp 4-shade mapping + CGA Palette 1 (default) |
+| **`dmg`** | White (`00b`) | Light Gray (`01b`) | Black (`11b`) | Black (`11b`) | Bold DMG contrast + CGA Palette 0 green tint |
 | **`high_con`** | White (`00b`) | White (`00b`) | Black (`11b`) | Black (`11b`) | Maximum 2-shade contrast for dim lighting |
-| **`dark`** | Black (`11b`) | Dark Gray (`10b`) | Light Gray (`01b`) | White (`00b`) | Inverted mode |
+| **`dark`** | Black (`11b`) | Dark Gray (`10b`) | Light Gray (`01b`) | White (`00b`) | Inverted dark-background mode |
 
 ---
 

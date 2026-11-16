@@ -167,7 +167,8 @@ pause_menu_run:
 
 .pm_resume:
 .pm_restore_screen:
-    ; Clear screen & redraw border in case palette changed or box covered margins
+    ; Clear screen, sync CGA hardware palette, & redraw border for active config
+    call    cga_sync_hw_palette
     call    cga_clear_screen
     call    cga_draw_border
     ; Force full palette + tile cache refresh on next frame render

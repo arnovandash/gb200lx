@@ -100,11 +100,11 @@ cfg_apply_palette:
     ret
 
 .pal_dmg:
-    ; Authentic 1989 Game Boy olive/greenish dither
+    ; Classic 1989 DMG bold contrast (dark foreground & sharp shadows)
     mov     byte [cfg_shade0], 00000000b  ; Lightest
-    mov     byte [cfg_shade1], 01010101b
-    mov     byte [cfg_shade2], 10101010b
-    mov     byte [cfg_shade3], 11111111b
+    mov     byte [cfg_shade1], 01010101b  ; Light Gray (55h)
+    mov     byte [cfg_shade2], 11111111b  ; Bold Dark  (FFh)
+    mov     byte [cfg_shade3], 11111111b  ; Black      (FFh)
     ret
 
 .pal_high_con:
@@ -195,7 +195,7 @@ cfg_load_ini:
 
     ; Read file into buffer
     mov     ah, 3Fh
-    mov     cx, 2000
+    mov     cx, 1500
     mov     dx, cfg_buffer
     int     21h
     jc      .close_fail
@@ -1213,5 +1213,5 @@ msg_setup_saved:
     db "Saved settings to GB200LX.INI successfully!", 0Dh, 0Ah
     db "Press [ENTER] to launch the game, or [ESC] to exit to DOS.", 0Dh, 0Ah, "$"
 
-cfg_buffer:         times 2048 db 0
+cfg_buffer:         times 1536 db 0
 cfg_buffer_len:     dw 0
