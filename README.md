@@ -28,7 +28,7 @@
   - *Bubble Ghost (USA, Europe)* — sprites, Window HUD, and full-speed gameplay.
 - **Current Limitations:**
   - ROMs larger than 64 KiB (e.g., 1 MiB MBC3 titles) are not yet supported (would require disk-paged bank overlays and SRAM persistence).
-  - Game Boy APU audio / PC speaker output is not yet implemented.
+  - Audio maps Game Boy Channels 1, 2 (square + sweep/envelope/length) and Channel 3 (wave fallback) to the single-voice HP 200LX PC speaker (Channel 4 noise is omitted).
 
 ---
 
@@ -42,6 +42,7 @@ Interpreting a 4.19 MHz Sharp SM83 CPU instruction-by-instruction on a 7.91 MHz 
 - **Strip-Based CGA Tile-Cache Renderer:** Decodes dirty 8×8 VRAM tiles on demand into `cga_tile_cache`, composites BG (with 1-pixel `SCX & 7` fine scroll and `STAT` `LYC` HUD split), Window, and OAM sprites into an offscreen 8 KiB `backbuffer_seg`, and blits to `0xB800`.
   - At `cycles=fixed 7910` (7.91 MHz 80186 equivalent) in DOSBox-X: *Bubble Ghost* draws in **~13.2 ms/frame** (full 60 fps, zero frameskip) and *Super Mario Land* draws in **~16.5 ms/frame**.
 - **59.73 Hz Hardware Pacing & Responsive Input:** Reprograms PIT channel 0 to 59.73 Hz (`INT 08h`, chaining the BIOS clock at 18.2 Hz) with adaptive frameskip (up to 3 skipped renders, ≥15 fps floor) and `HLT` idle sleep, plus `INT 09h` scancode hooking with per-frame joypad press latching.
+- **PC Speaker Sound Synthesis:** Synthesizes Game Boy APU Channels 1 & 2 (with length counters, envelopes, and Ch1 frequency sweep) plus Channel 3 wave fallback via PIT channel 2 (`0x42`/`0x61`).
 - **Relocation-Free Segmentation:** Multi-bank ROMs (up to 64 KiB / 4 banks) are split into contiguous 16-bit code segments with precomputed far-call dispatchers, requiring no EMS or protected-mode extenders.
 
 ---
@@ -55,6 +56,7 @@ Interpreting a 4.19 MHz Sharp SM83 CPU instruction-by-instruction on a 7.91 MHz 
 | **Display** | 320×200 4-shade grayscale LCD (CGA Mode 04h) | Centered 160×144 viewport with 4-shade palette mapping |
 | **Video Memory** | `B800:0000` / `BA00:0000` (Interleaved lines) | Dirty-cached 8-line strip rendering via offscreen backbuffer |
 | **Timer** | 8253/8254 PIT Channel 0 | Reprogrammed to 59.73 Hz (`INT 08h`, restored on exit) |
+| **Audio** | Internal PC speaker (PIT Channel 2, `0x42`/`0x61`) | Single-voice square wave synth from GB Ch1/Ch2/Ch3 |
 | **OS** | ROM-based MS-DOS 5.0 | Standalone MZ `.EXE` requiring no drivers or TSRs |
 
 ---
@@ -108,6 +110,7 @@ Place `GB200LX.INI` in the same directory as the executable (auto-created with d
 scaling = center          ; center (160x144 centered) or wide
 palette = pocket          ; pocket, dmg, high_con, dark
 vsync = 1
+sound = 1                 ; 1 = PC speaker sound on, 0 = mute
 
 [input]
 key_up     = UP
@@ -182,6 +185,7 @@ gb200lx/
 │   ├── video_cga.inc       # Video constants
 │   ├── config_ini.asm      # GB200LX.INI parser and text-mode /SETUP wizard
 │   ├── config_ini.inc      # Configuration structure offsets & constants
+│   ├── sound_spk.asm       # PIT Channel 2 PC speaker APU synthesizer (Ch1/Ch2/Ch3)
 │   └── recomp_helpers.asm  # Bank switching, DMA, MMIO, HALT pacing & far bridges
 ├── tools/                  # Build orchestration & MS-DOS packaging
 │   ├── build_rom.py        # Multi-segment CFG analyzer, 2-pass builder & .sym/.cdl loader

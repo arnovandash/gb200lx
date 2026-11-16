@@ -62,7 +62,7 @@ cfg_set_defaults:
     mov     byte [cfg_border],    1
     mov     byte [cfg_vsync],     1
     mov     byte [cfg_frameskip], 0
-    mov     byte [cfg_sound],     0
+    mov     byte [cfg_sound],     1
 
     mov     byte [cfg_key_up],     SCAN_UP
     mov     byte [cfg_key_down],   SCAN_DOWN
@@ -307,6 +307,11 @@ cfg_try_match_keys:
     call    cfg_str_starts_with
     jc      .val_palette
 
+    ; Check "sound"
+    mov     di, str_key_sound
+    call    cfg_str_starts_with
+    jc      .val_sound
+
     ; Check "key_up"
     mov     di, str_key_up
     call    cfg_str_starts_with
@@ -393,6 +398,17 @@ cfg_try_match_keys:
     ret
 .is_dark:
     mov     byte [cfg_palette], PAL_DARK
+    ret
+
+.val_sound:
+    pop     cx
+    pop     si
+    call    cfg_advance_to_value
+    mov     byte [cfg_sound], 0
+    cmp     byte [si], '0'
+    je      .sound_done
+    mov     byte [cfg_sound], 1
+.sound_done:
     ret
 
 .val_key_up:
@@ -825,7 +841,7 @@ cfg_palette:        db PAL_POCKET
 cfg_border:         db 1
 cfg_vsync:          db 1
 cfg_frameskip:      db 0
-cfg_sound:          db 0
+cfg_sound:          db 1
 
 cfg_key_up:         db SCAN_UP
 cfg_key_down:       db SCAN_DOWN
@@ -876,6 +892,7 @@ scancode_alpha_table:
 ; Key Strings
 str_key_scaling:    db "scaling", 0
 str_key_palette:    db "palette", 0
+str_key_sound:      db "sound", 0
 str_key_up:         db "key_up", 0
 str_key_down:       db "key_down", 0
 str_key_left:       db "key_left", 0
@@ -936,6 +953,7 @@ ini_template_part1:
     db "scaling = center", 0Dh, 0Ah
     db "palette = pocket", 0Dh, 0Ah
     db "vsync = 1", 0Dh, 0Ah
+    db "sound = 1", 0Dh, 0Ah
     db 0Dh, 0Ah
     db "[input]", 0Dh, 0Ah
     db "key_up = UP", 0Dh, 0Ah

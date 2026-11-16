@@ -113,3 +113,12 @@ Implemented in [runtime/video_cga.asm](runtime/video_cga.asm):
   - `helper_halt` sleeps with `sti; hlt` when ahead of schedule, enforces `1` Game Boy logic frame + VBlank/STAT/Timer ISR dispatch per tick, and skips `cga_render_gb_frame` when `frame_ticks > 0` up to `MAX_FRAME_SKIP` (`3`) consecutive frames (dropping excess ticks past `MAX_FRAME_BACKLOG = 6`).
 - **Low-Latency Input (`int09_handler` & `helper_read_joyp`):**
   - Intercepts IRQ1 scancodes (`in al, 60h`), acknowledges `0xE0` extended prefixes cleanly so arrow keys work reliably, and updates live `joypad_dir`/`joypad_act` bitmasks plus per-frame `joypad_dir_latch`/`joypad_act_latch` bytes (reset in `helper_halt`) so brief taps occurring mid-frame are still observed on the next `helper_read_joyp`.
+
+---
+
+## 8. PC Speaker APU Synthesis
+
+Implemented in [runtime/sound_spk.asm](runtime/sound_spk.asm):
+- **Register Hook (`apu_write_reg`):** `helper_write_mmio` forwards writes in `0xFF10..0xFF26` to track triggers, length counters, DAC enables, frequency updates, and `NR52` master mute.
+- **Per-Frame Sequencer (`apu_frame_tick`):** Runs once per 59.73 Hz frame at the end of `helper_halt` (after VBlank/Timer sound drivers finish), stepping 256 Hz length counters (4 ticks/frame), 64 Hz volume envelopes (1 tick/frame), and Ch1 128 Hz frequency sweep (2 ticks/frame, including overflow mute).
+- **Voice Arbitration & Glitch-Free PIT Output:** Picks the active voice among Ch1 and Ch2 (higher volume, breaking ties by most recently triggered channel), falling back to Ch3 Wave when both square channels are silent. Converts the 11-bit Game Boy period via `((2048 - F) * 2330) >> 8` (doubled for Ch3) and programs PIT Channel 2 (`0x42`/`0x43`/`0x61`), skipping mode resets when the divisor is unchanged and muting cleanly in `game_clean_exit`.

@@ -371,6 +371,15 @@ helper_write_mmio:
     je      short .mmio_dma
     cmp     bp, 0FF47h          ; BGP
     je      short .mmio_bgp
+    cmp     bp, 0FF10h          ; Game Boy APU registers 0xFF10..0xFF26
+    jb      short .mmio_none
+    cmp     bp, 0FF26h
+    jbe     short .mmio_apu
+.mmio_none:
+    popf
+    ret
+.mmio_apu:
+    call    apu_write_reg
     popf
     ret
 .mmio_lcdc:
@@ -594,6 +603,7 @@ helper_halt:
     call    near loc_00_0050
 
 .done:
+    call    apu_frame_tick
     popf
     ret
 
@@ -606,6 +616,8 @@ helper_mark_tile_dirty:
     mov     byte [cs:tile_dirty + bx], 1
     pop     bx
     ret
+
+%include "runtime/sound_spk.asm"
 
 %else
 ; ==============================================================================

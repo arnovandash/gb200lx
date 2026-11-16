@@ -230,6 +230,9 @@ game_clean_exit:
     ; Restore original INT 09h vector
     call    unhook_int09
 
+    ; Silence PC speaker before returning to DOS
+    call    spk_mute
+
     ; Restore PIT to 18.2 Hz and original INT 08h vector
     call    unhook_int08
 

@@ -21,6 +21,7 @@ If `GB200LX.INI` is missing when the executable starts, it is automatically crea
 scaling = center
 palette = pocket
 vsync = 1
+sound = 1
 
 [input]
 key_up = UP
@@ -41,6 +42,7 @@ key_menu = ESC
 | **`palette`** | `pocket`, `dmg`, `high_con`, `dark` | `pocket` | Selects the 4-shade CGA grayscale mapping (`cfg_shade0..3`). |
 | **`scaling`** | `center`, `wide` | `center` | Stored in INI and `/SETUP` (`center` = 160×144 viewport centered at `(80, 28)`). |
 | **`vsync`** | `1`, `0` | `1` | Kept for INI compatibility; frame pacing is governed by the 59.73 Hz PIT `INT 08h` clock. |
+| **`sound`** | `1`, `0` | `1` | Enables (`1`) or mutes (`0`) PC speaker APU synthesis on PIT Channel 2. |
 
 #### Palette Presets
 
