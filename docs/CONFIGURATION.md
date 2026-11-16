@@ -67,18 +67,29 @@ key_menu = ESC
 | **`key_b`** | B Button | `X` | |
 | **`key_select`** | Select | `SPACE` | |
 | **`key_start`** | Start | `ENTER` | |
-| **`key_menu`** | Exit to DOS | `ESC` | Restores PIT timer, `INT 08h`/`09h`, and text mode |
+| **`key_menu`** | Pause Menu | `ESC` | Opens the in-game pause menu (`Resume`, `Save State`, `Load State`, `Options`, `Quit`). |
 
 ### Supported Key Names
 - **Letters:** `A` through `Z`
-- **Numbers:** `0` through `9`
 - **Arrow Keys:** `UP`, `DOWN`, `LEFT`, `RIGHT`
-- **Special Keys:** `SPACE`, `ENTER`, `ESC`, `TAB`, `LSHIFT`, `RSHIFT`, `LCTRL`, `LALT`
-- **Raw Hex Scancodes:** `0x48`, `0x50`, `0x4B`, `0x4D`, etc.
+- **Special Keys:** `SPACE`, `ENTER`, `ESC`
 
 ---
 
-## 4. Interactive Setup Mode (`/SETUP`) & Test Mode (`/t`)
+## 4. In-Game Pause Menu & Save States
+
+Press **`ESC`** (or the configured `key_menu`) during gameplay to pause emulation, mute audio, and open the CGA pause overlay:
+- **Resume Game:** Clears the overlay and resumes execution immediately.
+- **Save State:** Writes the current 64 KiB Game Boy memory space, active 80186 hardware stack, ROM bank, timer/PPU state, and APU state to `GBSTATE0.SAV` (guarded by the ROM header checksum).
+- **Load State:** Validates `GBSTATE0.SAV` against the running ROM and restores gameplay cleanly.
+- **Options:** Adjust any video (`scaling`, `palette`, `vsync`, `sound`) or input (`key_up`..`key_menu`) setting in `GB200LX.INI`; changes to `palette` and `sound` apply immediately and persist to `GB200LX.INI` when leaving Options.
+- **Quit:** Restores PIT timer, `INT 08h`/`09h`, and MS-DOS text mode (`Mode 03h`) before exiting.
+
+Direct hotkeys **`F5`** (Quick Save) and **`F9`** (Quick Load) also read and write `GBSTATE0.SAV` without opening the menu.
+
+---
+
+## 5. Interactive Setup Mode (`/SETUP`) & Test Mode (`/t`)
 
 Launch `/SETUP` directly on the HP 200LX or via `make setup` in DOSBox-X:
 ```dos

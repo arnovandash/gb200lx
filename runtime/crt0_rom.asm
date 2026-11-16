@@ -215,7 +215,7 @@ main_game_loop:
     int     16h
     cmp     al, 1Bh                     ; ESC key
     jne     .frame_loop
-    mov     byte [cs:exit_requested], 1
+    mov     byte [cs:menu_requested], 1
     jmp     short .frame_loop
 
 .do_game_exit:
@@ -336,6 +336,11 @@ int08_handler:
     jmp     far [cs:old_int08_off]
 
 int09_handler:
+    cmp     byte [cs:menu_active], 0
+    je      short .game_key
+    jmp     far [cs:old_int09_off]
+
+.game_key:
     push    ax
     push    ds
     mov     ax, cs
@@ -345,11 +350,15 @@ int09_handler:
     cmp     al, 0E0h                    ; Ignore extended scancode prefix cleanly
     je      .key_ack
 
-    ; Check ESC / cfg_key_menu
+    ; Check ESC / cfg_key_menu (Pause Menu) and Save State hotkeys (F5 = 3Fh, F9 = 43h)
     cmp     al, [cfg_key_menu]
-    je      .handle_exit
+    je      .handle_menu
     cmp     al, 01h                     ; Failsafe ESC
-    je      .handle_exit
+    je      .handle_menu
+    cmp     al, 3Fh                     ; F5 -> Quick Save State
+    je      .handle_save
+    cmp     al, 43h                     ; F9 -> Quick Load State
+    je      .handle_load
 
     ; Game Boy Key Mapping
     mov     ah, al
@@ -460,8 +469,16 @@ int09_handler:
     pop     ax
     iret
 
-.handle_exit:
-    mov     byte [cs:exit_requested], 1
+.handle_menu:
+    mov     byte [cs:menu_requested], 1
+    jmp     short .key_ack
+
+.handle_save:
+    mov     byte [cs:save_requested], 1
+    jmp     short .key_ack
+
+.handle_load:
+    mov     byte [cs:load_requested], 1
     jmp     short .key_ack
 
 .chain_old:
@@ -527,7 +544,10 @@ global gb_mem_seg, backbuffer_seg
 gb_mem_seg:         dw  0
 backbuffer_seg:     dw  0
 
+global exit_requested, menu_requested, menu_active
 exit_requested:     db  0
+menu_requested:     db  0
+menu_active:        db  0
 global auto_exit_frames
 auto_exit_frames:   dw  0
 

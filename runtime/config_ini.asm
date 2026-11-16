@@ -82,6 +82,7 @@ cfg_set_defaults:
 ; ------------------------------------------------------------------------------
 ; cfg_apply_palette: Sets shade0..3 based on cfg_palette
 ; ------------------------------------------------------------------------------
+global cfg_apply_palette
 cfg_apply_palette:
     mov     al, [cfg_palette]
     cmp     al, PAL_DMG
@@ -312,6 +313,11 @@ cfg_try_match_keys:
     call    cfg_str_starts_with
     jc      .val_sound
 
+    ; Check "vsync"
+    mov     di, str_key_vsync
+    call    cfg_str_starts_with
+    jc      .val_vsync
+
     ; Check "key_up"
     mov     di, str_key_up
     call    cfg_str_starts_with
@@ -400,35 +406,20 @@ cfg_try_match_keys:
     mov     byte [cfg_palette], PAL_DARK
     ret
 
+.val_vsync:
+    pop     cx
+    pop     si
+    call    cfg_advance_to_value
+    call    cfg_parse_bool
+    mov     [cfg_vsync], al
+    ret
+
 .val_sound:
     pop     cx
     pop     si
     call    cfg_advance_to_value
-    mov     byte [cfg_sound], 0
-    mov     al, [si]
-    cmp     al, '0'
-    je      .sound_done
-    cmp     al, 'n'
-    je      .sound_done
-    cmp     al, 'N'
-    je      .sound_done
-    cmp     al, 'f'
-    je      .sound_done
-    cmp     al, 'F'
-    je      .sound_done
-    cmp     al, 'o'                 ; Distinguish "off" vs "on"
-    je      .sound_chk_o
-    cmp     al, 'O'
-    jne     .sound_on
-.sound_chk_o:
-    mov     al, [si + 1]
-    cmp     al, 'f'
-    je      .sound_done
-    cmp     al, 'F'
-    je      .sound_done
-.sound_on:
-    mov     byte [cfg_sound], 1
-.sound_done:
+    call    cfg_parse_bool
+    mov     [cfg_sound], al
     ret
 
 .val_key_up:
@@ -501,6 +492,36 @@ cfg_try_match_keys:
     call    cfg_advance_to_value
     call    cfg_resolve_key_name
     mov     [cfg_key_menu], al
+    ret
+
+; Parse "0"/"n"/"f"/"off" -> AL=0, else AL=1
+cfg_parse_bool:
+    mov     al, [si]
+    cmp     al, '0'
+    je      .pb_false
+    cmp     al, 'n'
+    je      .pb_false
+    cmp     al, 'N'
+    je      .pb_false
+    cmp     al, 'f'
+    je      .pb_false
+    cmp     al, 'F'
+    je      .pb_false
+    cmp     al, 'o'                 ; Distinguish "off" vs "on"
+    je      .pb_chk_o
+    cmp     al, 'O'
+    jne     .pb_true
+.pb_chk_o:
+    mov     al, [si + 1]
+    cmp     al, 'f'
+    je      .pb_false
+    cmp     al, 'F'
+    je      .pb_false
+.pb_true:
+    mov     al, 1
+    ret
+.pb_false:
+    xor     al, al
     ret
 
 ; Advance SI past '=' and leading spaces
@@ -636,14 +657,152 @@ cfg_resolve_key_name:
     ret
 
 ; ------------------------------------------------------------------------------
-; cfg_save_ini: Write current settings to GB200LX.INI
+; cfg_scancode_to_name: Convert hardware scancode in AL to ASCIIZ name at CS:SI.
+; Output: CS:SI = string pointer, CF = 0 if known key, CF = 1 if unknown.
+; Clobbers: BX
 ; ------------------------------------------------------------------------------
+global cfg_scancode_to_name
+cfg_scancode_to_name:
+    mov     bx, key_name_tab
+.kn_loop:
+    cmp     byte [cs:bx], 0
+    je      .kn_try_alpha
+    cmp     al, [cs:bx]
+    je      .kn_found
+    add     bx, 3
+    jmp     short .kn_loop
+.kn_found:
+    mov     si, [cs:bx + 1]
+    clc
+    ret
+.kn_try_alpha:
+    xor     bx, bx
+.ka_loop:
+    cmp     al, [cs:scancode_alpha_table + bx]
+    je      .ka_found
+    inc     bx
+    cmp     bx, 26
+    jb      .ka_loop
+    mov     si, str_name_space
+    stc
+    ret
+.ka_found:
+    mov     al, 'A'
+    add     al, bl
+    mov     [cs:str_alpha_buf], al
+    mov     si, str_alpha_buf
+    clc
+    ret
+
+; Append ASCIIZ string at CS:SI to ES:DI
+cfg_append_sz:
+    push    ax
+.cas_loop:
+    mov     al, [cs:si]
+    inc     si
+    test    al, al
+    jz      .cas_done
+    stosb
+    jmp     short .cas_loop
+.cas_done:
+    pop     ax
+    ret
+
+; ------------------------------------------------------------------------------
+; cfg_save_ini: Write all current runtime settings to GB200LX.INI
+; ------------------------------------------------------------------------------
+global cfg_save_ini
 cfg_save_ini:
     push    ax
     push    bx
     push    cx
     push    dx
+    push    si
+    push    di
+    push    ds
+    push    es
 
+    mov     ax, cs
+    mov     ds, ax
+    mov     es, ax
+    cld
+
+    mov     di, cfg_buffer
+    mov     si, ini_hdr_video
+    call    cfg_append_sz
+
+    ; scaling
+    mov     si, str_key_scaling
+    call    cfg_append_sz
+    mov     si, str_eq
+    call    cfg_append_sz
+    mov     si, str_val_center
+    cmp     byte [cfg_scaling], SCALE_WIDE
+    jne     .sv_scale
+    mov     si, str_val_wide
+.sv_scale:
+    call    cfg_append_sz
+    mov     ax, 0A0Dh
+    stosw
+
+    ; palette
+    mov     si, str_key_palette
+    call    cfg_append_sz
+    mov     si, str_eq
+    call    cfg_append_sz
+    mov     bl, [cfg_palette]
+    and     bx, 03h
+    shl     bx, 1
+    mov     si, [palette_str_tab + bx]
+    call    cfg_append_sz
+    mov     ax, 0A0Dh
+    stosw
+
+    ; vsync & sound
+    mov     si, str_key_vsync
+    call    cfg_append_sz
+    mov     si, str_eq
+    call    cfg_append_sz
+    mov     al, '0'
+    add     al, [cfg_vsync]
+    stosb
+    mov     ax, 0A0Dh
+    stosw
+
+    mov     si, str_key_sound
+    call    cfg_append_sz
+    mov     si, str_eq
+    call    cfg_append_sz
+    mov     al, '0'
+    add     al, [cfg_sound]
+    stosb
+    mov     ax, 0A0Dh
+    stosw
+
+    mov     si, ini_hdr_input
+    call    cfg_append_sz
+
+    ; 9 key bindings
+    mov     bx, ini_key_save_tab
+.sv_key_loop:
+    mov     si, [bx]
+    test    si, si
+    jz      .sv_write_file
+    call    cfg_append_sz
+    mov     si, str_eq
+    call    cfg_append_sz
+    mov     si, [bx + 2]
+    mov     al, [si]
+    push    bx
+    call    cfg_scancode_to_name
+    pop     bx
+    call    cfg_append_sz
+    mov     ax, 0A0Dh
+    stosw
+    add     bx, 4
+    jmp     short .sv_key_loop
+
+.sv_write_file:
     ; Create/overwrite GB200LX.INI
     mov     ah, 3Ch
     xor     cx, cx
@@ -652,26 +811,24 @@ cfg_save_ini:
     jc      .save_fail
     mov     bx, ax
 
-    ; Reflect current runtime settings in INI template before writing
-    mov     al, '0'
-    add     al, [cfg_sound]
-    mov     [ini_sound_char], al
-
-    ; Write formatted text
+    mov     cx, di
+    sub     cx, cfg_buffer          ; CX = formatted byte length
     mov     ah, 40h
-    mov     dx, ini_template_part1
-    mov     cx, ini_part1_len
+    mov     dx, cfg_buffer
     int     21h
 
-    ; Close file
     mov     ah, 3Eh
     int     21h
     clc
-    jmp     .save_exit
+    jmp     short .save_exit
 
 .save_fail:
     stc
 .save_exit:
+    pop     es
+    pop     ds
+    pop     di
+    pop     si
     pop     dx
     pop     cx
     pop     bx
@@ -951,6 +1108,7 @@ scancode_alpha_table:
 ; Key Strings
 str_key_scaling:    db "scaling", 0
 str_key_palette:    db "palette", 0
+str_key_vsync:      db "vsync", 0
 str_key_sound:      db "sound", 0
 str_key_up:         db "key_up", 0
 str_key_down:       db "key_down", 0
@@ -961,11 +1119,21 @@ str_key_b:          db "key_b", 0
 str_key_start:      db "key_start", 0
 str_key_select:     db "key_select", 0
 str_key_menu:       db "key_menu", 0
+str_eq:             db " = ", 0
 
+global str_val_center, str_val_wide, palette_str_tab
+str_val_center:     db "center", 0
 str_val_wide:       db "wide", 0
+str_val_pocket:     db "pocket", 0
 str_val_dmg:        db "dmg", 0
 str_val_high_con:   db "high_con", 0
 str_val_dark:       db "dark", 0
+
+palette_str_tab:
+    dw str_val_pocket
+    dw str_val_dmg
+    dw str_val_high_con
+    dw str_val_dark
 
 str_name_up:        db "UP", 0
 str_name_down:      db "DOWN", 0
@@ -974,6 +1142,42 @@ str_name_right:     db "RIGHT", 0
 str_name_enter:     db "ENTER", 0
 str_name_space:     db "SPACE", 0
 str_name_esc:       db "ESC", 0
+str_alpha_buf:      db 0, 0
+
+key_name_tab:
+    db SCAN_UP
+    dw str_name_up
+    db SCAN_DOWN
+    dw str_name_down
+    db SCAN_LEFT
+    dw str_name_left
+    db SCAN_RIGHT
+    dw str_name_right
+    db SCAN_ENTER
+    dw str_name_enter
+    db SCAN_SPACE
+    dw str_name_space
+    db SCAN_ESC
+    dw str_name_esc
+    db 0
+
+ini_key_save_tab:
+    dw str_key_up,     cfg_key_up
+    dw str_key_down,   cfg_key_down
+    dw str_key_left,   cfg_key_left
+    dw str_key_right,  cfg_key_right
+    dw str_key_a,      cfg_key_a
+    dw str_key_b,      cfg_key_b
+    dw str_key_select, cfg_key_select
+    dw str_key_start,  cfg_key_start
+    dw str_key_menu,   cfg_key_menu
+    dw 0
+
+ini_hdr_video:
+    db "; GB200LX Runtime Configuration", 0Dh, 0Ah
+    db "[video]", 0Dh, 0Ah, 0
+ini_hdr_input:
+    db 0Dh, 0Ah, "[input]", 0Dh, 0Ah, 0
 
 ; Messages
 msg_setup_title:
@@ -1008,28 +1212,6 @@ msg_setup_saved:
     db "------------------------------------------------------------------", 0Dh, 0Ah
     db "Saved settings to GB200LX.INI successfully!", 0Dh, 0Ah
     db "Press [ENTER] to launch the game, or [ESC] to exit to DOS.", 0Dh, 0Ah, "$"
-
-ini_template_part1:
-    db "; GB200LX Runtime Configuration for HP 200LX", 0Dh, 0Ah
-    db "[video]", 0Dh, 0Ah
-    db "scaling = center", 0Dh, 0Ah
-    db "palette = pocket", 0Dh, 0Ah
-    db "vsync = 1", 0Dh, 0Ah
-    db "sound = "
-ini_sound_char:
-    db "1", 0Dh, 0Ah
-    db 0Dh, 0Ah
-    db "[input]", 0Dh, 0Ah
-    db "key_up = UP", 0Dh, 0Ah
-    db "key_down = DOWN", 0Dh, 0Ah
-    db "key_left = LEFT", 0Dh, 0Ah
-    db "key_right = RIGHT", 0Dh, 0Ah
-    db "key_a = Z", 0Dh, 0Ah
-    db "key_b = X", 0Dh, 0Ah
-    db "key_select = SPACE", 0Dh, 0Ah
-    db "key_start = ENTER", 0Dh, 0Ah
-    db "key_menu = ESC", 0Dh, 0Ah
-ini_part1_len equ ($ - ini_template_part1)
 
 cfg_buffer:         times 2048 db 0
 cfg_buffer_len:     dw 0

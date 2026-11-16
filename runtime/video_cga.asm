@@ -1130,10 +1130,10 @@ update_cga_tile_cache:
     mov     ax, cs
     mov     es, ax
     mov     di, tile_dirty
-    xor     al, al
     mov     cx, 384
     cld
 .scan_dirty:
+    xor     al, al
     repe    scasb
     jz      .cache_done
     ; Found dirty tile at index = (DI - 1) - tile_dirty
@@ -1371,6 +1371,7 @@ render_spr_tile:        db 0
 render_spr_attr:        db 0
 render_spr_pal_tab:     db 0, 0, 0, 0
 render_win_scol:        db 0
+global last_bgp
 last_bgp:               db 0FFh
 render_bg0_shade:       db 0
 render_fine_x:          db 0

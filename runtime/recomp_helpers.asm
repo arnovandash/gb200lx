@@ -480,9 +480,26 @@ helper_halt:
     push    es
     push    bp
 
-    ; Check if ESC / exit was requested via INT 09h ISR
+    ; Check if ESC / exit was requested
     cmp     byte [cs:exit_requested], 1
     je      .do_exit
+
+    ; Pause Menu hotkey (ESC / cfg_key_menu)
+    cmp     byte [cs:menu_requested], 1
+    jne     short .no_menu
+    mov     [cs:halt_sp_base], sp
+    call    pause_menu_run
+    cmp     byte [cs:exit_requested], 1
+    je      .do_exit
+.no_menu:
+
+    ; Save / Load State hotkeys (F5 / F9)
+    cmp     byte [cs:load_requested], 1
+    je      near savestate_load
+    cmp     byte [cs:save_requested], 1
+    jne     short .no_savestate
+    call    savestate_save
+.no_savestate:
 
     ; --- Fixed 59.73 Hz frame pacing (INT 08h ticks) with adaptive frameskip ---
     ; Game logic always advances exactly one GB frame per tick, so game speed
@@ -536,8 +553,9 @@ helper_halt:
     jz      .check_vblank
     mov     ah, 00h
     int     16h
-    cmp     al, 1Bh                     ; ESC key
-    je      game_clean_exit
+    cmp     al, 1Bh                     ; ESC key -> Pause Menu
+    jne     short .check_keys
+    mov     byte [cs:menu_requested], 1
     jmp     short .check_keys
 
 .check_vblank:
@@ -618,6 +636,8 @@ helper_mark_tile_dirty:
     ret
 
 %include "runtime/sound_spk.asm"
+%include "runtime/savestate.asm"
+%include "runtime/pause_menu.asm"
 
 %else
 ; ==============================================================================

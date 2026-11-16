@@ -121,10 +121,14 @@ key_a      = Z
 key_b      = X
 key_select = SPACE
 key_start  = ENTER
-key_menu   = ESC
+key_menu   = ESC             ; Open in-game pause menu (Resume/Save/Load/Options/Quit)
 ```
 
-### 2. Interactive Palmtop Setup Mode (`/SETUP`)
+### 2. In-Game Pause Menu & Save States
+- **`ESC`** (or `key_menu`): Pauses gameplay and opens a CGA overlay menu with **Resume Game**, **Save State**, **Load State**, **Options** (adjusts any setting in `GB200LX.INI` live and saves back to disk), and **Quit**.
+- **`F5` / `F9`**: Quick Save / Quick Load state directly to `GBSTATE0.SAV` (snapshots 64 KiB GB RAM, active 80186 hardware stack, timer/PPU state, and APU state with ROM checksum validation).
+
+### 3. Interactive Palmtop Setup Mode (`/SETUP`)
 Launch the recompiled binary with `/SETUP` on the HP 200LX (or `make setup` in DOSBox-X):
 ```dos
 C:\GAMES> GAME.EXE /SETUP
@@ -186,6 +190,8 @@ gb200lx/
 │   ├── config_ini.asm      # GB200LX.INI parser and text-mode /SETUP wizard
 │   ├── config_ini.inc      # Configuration structure offsets & constants
 │   ├── sound_spk.asm       # PIT Channel 2 PC speaker APU synthesizer (Ch1/Ch2/Ch3)
+│   ├── savestate.asm       # Quick Save/Load (F5/F9 -> GBSTATE0.SAV)
+│   ├── pause_menu.asm      # ESC pause overlay menu & live GB200LX.INI options editor
 │   └── recomp_helpers.asm  # Bank switching, DMA, MMIO, HALT pacing & far bridges
 ├── tools/                  # Build orchestration & MS-DOS packaging
 │   ├── build_rom.py        # Multi-segment CFG analyzer, 2-pass builder & .sym/.cdl loader
@@ -205,7 +211,7 @@ gb200lx/
 
 ## TODO / Roadmap
 
-- [ ] **Save States:** Snapshot/restore Game Boy RAM (`gb_mem_seg`), CPU registers, APU/timer state, and active ROM bank to disk via hotkey.
+- [x] **Save States & Pause Menu:** Snapshot/restore 64 KiB Game Boy RAM, active hardware stack, timer/PPU, and APU state to `GBSTATE0.SAV` (`F5`/`F9` or via the `ESC` pause menu with live `GB200LX.INI` options).
 - [ ] **AdLib / OPL2 Sound Support:** Optional multi-channel FM synthesis driver (`0x388`/`0x389`) for DOS PCs and emulators alongside the HP 200LX PC speaker driver.
 - [ ] **Dynamic Bank Switching (> 64 KiB ROMs):** Disk-paged or EMS-backed code/data overlays for larger MBC1/MBC3/MBC5 titles (e.g., 1 MiB+ games).
 - [ ] **Battery-Backed SRAM Saving:** Persist external cartridge RAM (`0xA000–0xBFFF`, plus MBC3 RTC where applicable) to `.SAV` files for games like *Pokémon*.

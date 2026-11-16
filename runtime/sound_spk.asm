@@ -472,7 +472,9 @@ apu_frame_tick:
     ret
 
 ;apu state in CS
+global apu_cur_div, apu_state_start, apu_state_end
 apu_cur_div:        dw 0
+apu_state_start:
 apu_ch1_freq:       dw 0
 apu_ch1_swp_shadow: dw 0
 apu_ch2_freq:       dw 0
@@ -489,3 +491,4 @@ apu_ch1_on:         db 0
 apu_ch2_on:         db 0
 apu_ch3_on:         db 0
 apu_last_trig:      db 1
+apu_state_end:
