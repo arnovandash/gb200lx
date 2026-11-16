@@ -39,13 +39,17 @@ global cga_sync_hw_palette
 cga_sync_hw_palette:
     push    ax
     push    bx
-    mov     ax, 0B00h
-    mov     bx, 0101h               ; Palette 1 (Cyan/Magenta/White)
+    mov     bx, 0100h               ; Default (pocket): CGA Palette 0 (Green/Red/Yellow)
     xor     al, al                  ; Background/Border = Black (00h)
-    cmp     byte [cs:cfg_palette], PAL_DMG
-    jne     .set_pal
-    mov     bl, 00h                 ; DMG: Palette 0 (Green/Red/Brown)
-    mov     al, 02h                 ; DMG: Green background (02h)
+    mov     ah, [cs:cfg_palette]
+    cmp     ah, PAL_DMG
+    jne     .chk_pal1
+    mov     al, 02h                 ; DMG: Green background (02h) + Palette 0
+    jmp     short .set_pal
+.chk_pal1:
+    cmp     ah, PAL_POCKET
+    je      .set_pal
+    mov     bl, 01h                 ; high_con / dark: CGA Palette 1 (Cyan/Magenta/White)
 .set_pal:
     push    ax
     mov     ah, 0Bh

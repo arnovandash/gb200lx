@@ -48,10 +48,10 @@ key_menu = ESC
 
 | Palette | Shade 0 | Shade 1 | Shade 2 | Shade 3 | Notes |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`pocket`** | White (`00b`) | Light Gray (`01b`) | Dark Gray (`10b`) | Black (`11b`) | Crisp 4-shade mapping + CGA Palette 1 (default) |
-| **`dmg`** | White (`00b`) | Light Gray (`01b`) | Black (`11b`) | Black (`11b`) | Bold DMG contrast + CGA Palette 0 green tint |
-| **`high_con`** | White (`00b`) | White (`00b`) | Black (`11b`) | Black (`11b`) | Maximum 2-shade contrast for dim lighting |
-| **`dark`** | Black (`11b`) | Dark Gray (`10b`) | Light Gray (`01b`) | White (`00b`) | Inverted dark-background mode |
+| **`pocket`** | White (`00b`) | Light Gray (`01b`) | Dark Gray (`10b`) | Black (`11b`) | Crisp 4-shade mapping + CGA Palette 0 (default) |
+| **`dmg`** | White (`00b`) | Light Gray (`01b`) | Black (`11b`) | Black (`11b`) | Bold DMG contrast + CGA Palette 0 green BG |
+| **`high_con`** | White (`00b`) | White (`00b`) | Black (`11b`) | Black (`11b`) | Maximum 2-shade B&W contrast + CGA Palette 1 |
+| **`dark`** | Black (`11b`) | Dark Gray (`10b`) | Light Gray (`01b`) | White (`00b`) | Inverted dark-background mode + CGA Palette 1 |
 
 ---
 
