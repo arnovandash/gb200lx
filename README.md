@@ -43,6 +43,7 @@ Interpreting a 4.19 MHz Sharp SM83 CPU instruction-by-instruction on a 7.91 MHz 
   - At `cycles=fixed 7910` (7.91 MHz 80186 equivalent) in DOSBox-X: *Bubble Ghost* draws in **~13.2 ms/frame** (full 60 fps, zero frameskip) and *Super Mario Land* draws in **~16.5 ms/frame**.
 - **59.73 Hz Hardware Pacing & Responsive Input:** Reprograms PIT channel 0 to 59.73 Hz (`INT 08h`, chaining the BIOS clock at 18.2 Hz) with adaptive frameskip (up to 3 skipped renders, ≥15 fps floor) and `HLT` idle sleep, plus `INT 09h` scancode hooking with per-frame joypad press latching.
 - **PC Speaker Sound Synthesis:** Synthesizes Game Boy APU Channels 1 & 2 (with length counters, envelopes, and Ch1 frequency sweep) plus Channel 3 wave fallback via PIT channel 2 (`0x42`/`0x61`).
+- **Save States & In-Game Pause Menu:** Quick-save (`F5`) and quick-load (`F9`) to `GBSTATE0.SAV`, plus an `ESC` pause overlay (`Resume Game`, `Save State`, `Load State`, live `Options` editor saving to `GB200LX.INI`, and `Quit`).
 - **Relocation-Free Segmentation:** Multi-bank ROMs (up to 64 KiB / 4 banks) are split into contiguous 16-bit code segments with precomputed far-call dispatchers, requiring no EMS or protected-mode extenders.
 
 ---
@@ -53,7 +54,7 @@ Interpreting a 4.19 MHz Sharp SM83 CPU instruction-by-instruction on a 7.91 MHz 
 | :--- | :--- | :--- |
 | **CPU** | Intel Hornet 80186 ASIC @ 7.91 MHz | Native 16-bit 80186 instructions only (`bits 16`, `cpu 186`) |
 | **RAM** | 636 KiB Conventional MS-DOS RAM | ~240–310 KiB footprint (EXE + 64 KiB GB RAM + 8 KiB backbuffer + stack) |
-| **Display** | 320×200 4-shade grayscale LCD (CGA Mode 04h) | Centered 160×144 viewport with 4-shade palette mapping |
+| **Display** | 320×200 4-shade grayscale LCD (CGA Mode 04h) | Centered 160×144 or 2× wide 320×144 viewport with 4-shade & CGA palette mapping |
 | **Video Memory** | `B800:0000` / `BA00:0000` (Interleaved lines) | Dirty-cached 8-line strip rendering via offscreen backbuffer |
 | **Timer** | 8253/8254 PIT Channel 0 | Reprogrammed to 59.73 Hz (`INT 08h`, restored on exit) |
 | **Audio** | Internal PC speaker (PIT Channel 2, `0x42`/`0x61`) | Single-voice square wave synth from GB Ch1/Ch2/Ch3 |
@@ -107,9 +108,9 @@ For full details on flag lowering, control-flow discovery, indirect writes, and 
 Place `GB200LX.INI` in the same directory as the executable (auto-created with defaults if absent):
 ```ini
 [video]
-scaling = center          ; center (160x144 centered) or wide
+scaling = center          ; center (160x144) or wide (320x144 2x horizontal stretch)
 palette = pocket          ; pocket, dmg, high_con, dark
-vsync = 1
+vsync = 1                 ; 1 = wait for CGA VRetrace (0x03DA bit 3), 0 = off
 sound = 1                 ; 1 = PC speaker sound on, 0 = mute
 
 [input]

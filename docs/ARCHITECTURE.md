@@ -59,7 +59,7 @@ In [codegen_80186/recompiler_80186.py](codegen_80186/recompiler_80186.py):
   - Automatic `helper_halt` yield insertion on 3-instruction `LDH/LD A, (RAM); AND/OR A, A; JR Z, start` busy-wait spin loops.
 - **Label Resynchronization:** Any instruction that would overlap an interior branch target is split into raw bytes (`db`) so disassembly stays aligned at every discovered entry point.
 - **Two-Pass Relocation-Free Segmentation:**
-  1. **Bank 0 (`seg0`):** Holds `crt0_rom.asm`, `video_cga.asm`, `config_ini.asm`, `recomp_helpers.asm`, recompiled Bank 0 code, `b0_helper_table` at fixed offsets `0004h..0020h`, and `b0_entry_table` starting at `0024h`.
+  1. **Bank 0 (`seg0`):** Holds `crt0_rom.asm`, `video_cga.asm`, `config_ini.asm`, `sound_spk.asm`, `savestate.asm`, `pause_menu.asm`, `recomp_helpers.asm`, recompiled Bank 0 code, `b0_helper_table` at fixed offsets `0004h..0020h`, and `b0_entry_table` starting at `0024h`.
   2. **Banks 1–3 (`seg1..seg3`):** Each bank is assembled with `org 0`, starting with a `dispatch_bN` jump table (4 bytes per entry).
   3. **Pass 1 / Pass 2:** Pass 1 measures exact segment paragraph sizes (`SEG1_PARAS_VAL`, `SEG2_PARAS_VAL`, `SEG3_PARAS_VAL`, `SEG_ROM_PARAS_VAL`), then Pass 2 re-assembles with exact segment deltas and packs `build/GAME.BIN` -> `build/GAME.EXE` via [tools/mzpack.py](tools/mzpack.py).
 
@@ -102,7 +102,7 @@ Implemented in [runtime/video_cga.asm](runtime/video_cga.asm):
 3. **Window Layer:** Uses `render_aligned_strip` with `cga_tile_cache` from `WY`/`WX` downward.
 4. **OAM Sprites (40 entries, 8×8 or 8×16):**
    - Rendered back-to-front (`39 -> 0`) with precomputed 3-shade palette per visible sprite, immediate empty-row skipping (`test ax, ax; jz`), `shl`/`shr` + `adc` pixel extraction, table-driven CGA masking, and OAM attribute bit 7 (OBJ-behind-BG-colors-1..3).
-5. **Backbuffer Blit:** Copies the 144 composited 40-byte scanlines from `backbuffer_seg` to interleaved CGA VRAM `0xB800` via `cga_scanline_offsets`.
+5. **Backbuffer Blit & Palette Sync:** Optionally polls `0x03DA` bit 3 (`cfg_vsync = 1`, bounded 4,000-iteration timeout), then copies the 144 composited 40-byte scanlines from `backbuffer_seg` to interleaved CGA VRAM `0xB800` via `cga_scanline_offsets`—either 1:1 `rep movsw` (`SCALE_CENTER`, `160×144`) or 2× horizontally stretched via the 512-byte `cga_wide_table` (`SCALE_WIDE`, `320×144`). `cga_sync_hw_palette` programs BIOS `INT 10h AH=0Bh` (CGA Palette `0` for `pocket`/`dmg` vs Palette `1` for `high_con`/`dark`), and `cga_clear_screen` clears surrounding borders to `cfg_shade0`.
 
 ---
 
@@ -112,7 +112,7 @@ Implemented in [runtime/video_cga.asm](runtime/video_cga.asm):
   - `hook_int08` reprograms PIT channel 0 to divisor `19977` (`1193182 / 19977 ≈ 59.73 Hz`), incrementing `frame_ticks` on each tick and chaining the original BIOS `INT 08h` handler at the average 18.2 Hz overflow rate so the DOS clock stays accurate. Original PIT divisor and `INT 08h` vector are restored on exit.
   - `helper_halt` sleeps with `sti; hlt` when ahead of schedule, enforces `1` Game Boy logic frame + VBlank/STAT/Timer ISR dispatch per tick, and skips `cga_render_gb_frame` when `frame_ticks > 0` up to `MAX_FRAME_SKIP` (`3`) consecutive frames (dropping excess ticks past `MAX_FRAME_BACKLOG = 6`).
 - **Low-Latency Input (`int09_handler` & `helper_read_joyp`):**
-  - Intercepts IRQ1 scancodes (`in al, 60h`), acknowledges `0xE0` extended prefixes cleanly so arrow keys work reliably, and updates live `joypad_dir`/`joypad_act` bitmasks plus per-frame `joypad_dir_latch`/`joypad_act_latch` bytes (reset in `helper_halt`) so brief taps occurring mid-frame are still observed on the next `helper_read_joyp`.
+  - Intercepts IRQ1 scancodes (`in al, 60h`), acknowledges `0xE0` extended prefixes cleanly so arrow keys work reliably, triggers `F5`/`F9` save-state flags and `ESC`/`cfg_key_menu` pause requests, and updates live `joypad_dir`/`joypad_act` bitmasks plus per-frame `joypad_dir_latch`/`joypad_act_latch` bytes (reset in `helper_halt`). While `menu_active = 1`, IRQ1 chains directly to `old_int09` so BIOS `INT 16h` serves the pause menu natively.
 
 ---
 
@@ -122,3 +122,14 @@ Implemented in [runtime/sound_spk.asm](runtime/sound_spk.asm):
 - **Register Hook (`apu_write_reg`):** `helper_write_mmio` forwards writes in `0xFF10..0xFF26` to track triggers, length counters, DAC enables, frequency updates, and `NR52` master mute.
 - **Per-Frame Sequencer (`apu_frame_tick`):** Runs once per 59.73 Hz frame at the end of `helper_halt` (after VBlank/Timer sound drivers finish), stepping 256 Hz length counters (4 ticks/frame), 64 Hz volume envelopes (1 tick/frame), and Ch1 128 Hz frequency sweep (2 ticks/frame, including overflow mute).
 - **Voice Arbitration & Glitch-Free PIT Output:** Picks the active voice among Ch1 and Ch2 (higher volume, breaking ties by most recently triggered channel), falling back to Ch3 Wave when both square channels are silent. Converts the 11-bit Game Boy period via `((2048 - F) * 2330) >> 8` (doubled for Ch3) and programs PIT Channel 2 (`0x42`/`0x43`/`0x61`), skipping mode resets when the divisor is unchanged and muting cleanly in `game_clean_exit`.
+
+---
+
+## 9. Save States & In-Game Pause Menu
+
+- **Save States ([runtime/savestate.asm](runtime/savestate.asm)):**
+  - `savestate_save` (and `savestate_save_from_pause`, using `halt_sp_base` captured in `helper_halt`) writes `GBSTATE0.SAV` via DOS `INT 21h`: a 64-byte header (`GB200ST1` magic, `0x014E..0x014F` ROM checksum, `CS`, `SP`, stack byte length, `gb_ime`, `current_rom_bank`, `emulated_ly`, `div_counter`, `hud_scy`/`hud_scx`, and APU state `apu_state_start..apu_state_end`), the active hardware stack slice `SS:[halt_sp..8000h)`, and all 64 KiB of `gb_mem_seg`.
+  - `savestate_load` validates the magic, ROM checksum, and stack bounds via `savestate_open_valid`, reloads stack and `gb_mem_seg`, relocates any `CS`/`seg_bank*`/`gb_mem_seg`/`backbuffer_seg` words on the restored stack if DOS loaded at a different paragraph, resets `last_bgp` and all 384 `tile_dirty` entries, and jumps to `helper_halt.do_render`.
+- **ESC Pause Menu ([runtime/pause_menu.asm](runtime/pause_menu.asm)):**
+  - Triggered from `helper_halt` when `menu_requested == 1`, muting PIT Ch2 and drawing a centered CGA Mode `04h` overlay (`y=23..176`, covering the Game Boy viewport) using BIOS `INT 10h` text output (`Resume Game`, `Save State`, `Load State`, `Options`, `Quit`).
+  - The **Options** submenu adjusts every `[video]` (`scaling`, `palette`, `vsync`, `sound`) and `[input]` (`key_up`..`key_menu`) setting in place, persists changes via `cfg_save_ini` in [runtime/config_ini.asm](runtime/config_ini.asm), and reapplies CGA palette, border, and tile-cache state cleanly on resume.
