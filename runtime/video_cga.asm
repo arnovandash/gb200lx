@@ -746,16 +746,22 @@ cga_render_gb_frame:
 
 .fine_shift:
     shl     cl, 1               ; CL = 2, 4, or 6 bits
-    mov     bx, GB_BYTES_PER_LINE
-.shift_byte_loop:
+    mov     bx, (GB_BYTES_PER_LINE / 2) ; 20 words = 40 bytes
+    cld
+.shift_word_loop:
     mov     ah, [cs:si]
     mov     al, [cs:si+1]
     shl     ax, cl
-    mov     [es:di], ah
-    inc     si
-    inc     di
+    mov     dl, ah
+    mov     ah, [cs:si+1]
+    mov     al, [cs:si+2]
+    shl     ax, cl
+    mov     dh, ah
+    mov     ax, dx
+    stosw
+    add     si, 2
     dec     bx
-    jnz     .shift_byte_loop
+    jnz     .shift_word_loop
 
 .line_done:
     pop     cx

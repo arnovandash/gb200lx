@@ -293,41 +293,49 @@ int09_handler:
     cmp     ah, [cfg_key_right]
     jne     .kp_left
     and     byte [cs:joypad_dir], ~01h
+    and     byte [cs:joypad_dir_latch], ~01h
     jmp     .key_ack
 .kp_left:
     cmp     ah, [cfg_key_left]
     jne     .kp_up
     and     byte [cs:joypad_dir], ~02h
+    and     byte [cs:joypad_dir_latch], ~02h
     jmp     .key_ack
 .kp_up:
     cmp     ah, [cfg_key_up]
     jne     .kp_down
     and     byte [cs:joypad_dir], ~04h
+    and     byte [cs:joypad_dir_latch], ~04h
     jmp     .key_ack
 .kp_down:
     cmp     ah, [cfg_key_down]
     jne     .kp_a
     and     byte [cs:joypad_dir], ~08h
+    and     byte [cs:joypad_dir_latch], ~08h
     jmp     .key_ack
 .kp_a:
     cmp     ah, [cfg_key_a]
     jne     .kp_b
     and     byte [cs:joypad_act], ~01h
+    and     byte [cs:joypad_act_latch], ~01h
     jmp     .key_ack
 .kp_b:
     cmp     ah, [cfg_key_b]
     jne     .kp_sel
     and     byte [cs:joypad_act], ~02h
+    and     byte [cs:joypad_act_latch], ~02h
     jmp     .key_ack
 .kp_sel:
     cmp     ah, [cfg_key_select]
     jne     .kp_start
     and     byte [cs:joypad_act], ~04h
+    and     byte [cs:joypad_act_latch], ~04h
     jmp     .key_ack
 .kp_start:
     cmp     ah, [cfg_key_start]
     jne     .chain_old
     and     byte [cs:joypad_act], ~08h
+    and     byte [cs:joypad_act_latch], ~08h
     jmp     .key_ack
 
 .key_released:

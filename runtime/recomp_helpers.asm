@@ -366,17 +366,21 @@ helper_read_joyp:
 
     test    al, 10h             ; P14: Direction keys selected (bit 4 == 0)
     jnz     short .check_action
-    ; Direction keys selected: merge joypad_dir (bits 3..0)
+    ; Direction keys selected: merge live + latched joypad_dir (bits 3..0)
+    mov     al, [cs:joypad_dir]
+    and     al, [cs:joypad_dir_latch]
     and     bl, 0F0h
-    or      bl, [cs:joypad_dir]
+    or      bl, al
     jmp     short .joyp_done
 
 .check_action:
     test    al, 20h             ; P15: Action buttons selected (bit 5 == 0)
     jnz     short .joyp_done
-    ; Action buttons selected: merge joypad_act (bits 3..0)
+    ; Action buttons selected: merge live + latched joypad_act (bits 3..0)
+    mov     al, [cs:joypad_act]
+    and     al, [cs:joypad_act_latch]
     and     bl, 0F0h
-    or      bl, [cs:joypad_act]
+    or      bl, al
 
 .joyp_done:
     mov     al, bl
@@ -433,6 +437,10 @@ helper_halt:
     ; Check if ESC / exit was requested via INT 09h ISR
     cmp     byte [cs:exit_requested], 1
     je      .do_exit
+
+    ; Clear per-frame press latches before rendering so any tap during render is caught
+    mov     byte [cs:joypad_dir_latch], 0FFh
+    mov     byte [cs:joypad_act_latch], 0FFh
 
     ; Render CGA frame (needs DS = gb_mem_seg)
     mov     ax, [cs:gb_mem_seg]
@@ -686,6 +694,8 @@ rom_bank_mask:      db  03h     ; ROM bank bitmask (default 03h for 4 banks)
 emulated_ly:        db  148     ; Current emulated scanline (default 148 = 0x94 VBlank)
 div_counter:        db  0       ; DIV register counter
 
-global joypad_dir, joypad_act
+global joypad_dir, joypad_act, joypad_dir_latch, joypad_act_latch
 joypad_dir:         db  0Fh     ; Bits 3..0: Down, Up, Left, Right (1=released, 0=pressed)
 joypad_act:         db  0Fh     ; Bits 3..0: Start, Select, B, A (1=released, 0=pressed)
+joypad_dir_latch:   db  0FFh    ; Latched key-down events during frame render
+joypad_act_latch:   db  0FFh    ; Latched action key-down events during frame render
