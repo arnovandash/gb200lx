@@ -203,6 +203,15 @@ gb200lx/
 
 ---
 
+## TODO / Roadmap
+
+- [ ] **Save States:** Snapshot/restore Game Boy RAM (`gb_mem_seg`), CPU registers, APU/timer state, and active ROM bank to disk via hotkey.
+- [ ] **AdLib / OPL2 Sound Support:** Optional multi-channel FM synthesis driver (`0x388`/`0x389`) for DOS PCs and emulators alongside the HP 200LX PC speaker driver.
+- [ ] **Dynamic Bank Switching (> 64 KiB ROMs):** Disk-paged or EMS-backed code/data overlays for larger MBC1/MBC3/MBC5 titles (e.g., 1 MiB+ games).
+- [ ] **Battery-Backed SRAM Saving:** Persist external cartridge RAM (`0xA000–0xBFFF`, plus MBC3 RTC where applicable) to `.SAV` files for games like *Pokémon*.
+
+---
+
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details. Game Boy is a registered trademark of Nintendo Co., Ltd. This project is an independent engineering effort and is not affiliated with or endorsed by Nintendo.
