@@ -405,8 +405,28 @@ cfg_try_match_keys:
     pop     si
     call    cfg_advance_to_value
     mov     byte [cfg_sound], 0
-    cmp     byte [si], '0'
+    mov     al, [si]
+    cmp     al, '0'
     je      .sound_done
+    cmp     al, 'n'
+    je      .sound_done
+    cmp     al, 'N'
+    je      .sound_done
+    cmp     al, 'f'
+    je      .sound_done
+    cmp     al, 'F'
+    je      .sound_done
+    cmp     al, 'o'                 ; Distinguish "off" vs "on"
+    je      .sound_chk_o
+    cmp     al, 'O'
+    jne     .sound_on
+.sound_chk_o:
+    mov     al, [si + 1]
+    cmp     al, 'f'
+    je      .sound_done
+    cmp     al, 'F'
+    je      .sound_done
+.sound_on:
     mov     byte [cfg_sound], 1
 .sound_done:
     ret
@@ -632,6 +652,11 @@ cfg_save_ini:
     jc      .save_fail
     mov     bx, ax
 
+    ; Reflect current runtime settings in INI template before writing
+    mov     al, '0'
+    add     al, [cfg_sound]
+    mov     [ini_sound_char], al
+
     ; Write formatted text
     mov     ah, 40h
     mov     dx, ini_template_part1
@@ -739,6 +764,40 @@ cfg_run_interactive_setup:
     je      .cancel_setup
     mov     [cfg_key_start], al
     call    print_key_name
+
+    ; 9. Enable / Disable Sound
+    mov     dx, msg_prompt_sound
+    call    print_dos_str
+.wait_sound_key:
+    mov     ah, 00h
+    int     16h
+    cmp     al, 1Bh                 ; ESC
+    je      .cancel_setup
+    cmp     al, 'n'
+    je      .sound_set_off
+    cmp     al, 'N'
+    je      .sound_set_off
+    cmp     al, '0'
+    je      .sound_set_off
+    cmp     al, 'y'
+    je      .sound_set_on
+    cmp     al, 'Y'
+    je      .sound_set_on
+    cmp     al, '1'
+    je      .sound_set_on
+    cmp     al, 0Dh                 ; Enter keeps Sound ON
+    je      .sound_set_on
+    jmp     short .wait_sound_key
+.sound_set_off:
+    mov     byte [cfg_sound], 0
+    mov     dx, msg_sound_off
+    call    print_dos_str
+    jmp     short .sound_prompt_done
+.sound_set_on:
+    mov     byte [cfg_sound], 1
+    mov     dx, msg_sound_on
+    call    print_dos_str
+.sound_prompt_done:
 
     ; Save settings to GB200LX.INI
     call    cfg_save_ini
@@ -924,14 +983,17 @@ msg_setup_title:
     db "==================================================================", 0Dh, 0Ah
     db "Press the physical key on your keyboard for each button (ESC cancels):", 0Dh, 0Ah, 0Dh, 0Ah, "$"
 
-msg_prompt_up:    db "  [1/8] D-Pad UP:              $", 0
-msg_prompt_down:  db "  [2/8] D-Pad DOWN:            $", 0
-msg_prompt_left:  db "  [3/8] D-Pad LEFT:            $", 0
-msg_prompt_right: db "  [4/8] D-Pad RIGHT:           $", 0
-msg_prompt_a:     db "  [5/8] Button A:              $", 0
-msg_prompt_b:     db "  [6/8] Button B:              $", 0
-msg_prompt_sel:   db "  [7/8] SELECT:                $", 0
-msg_prompt_start: db "  [8/8] START:                 $", 0
+msg_prompt_up:    db "  [1/9] D-Pad UP:              $", 0
+msg_prompt_down:  db "  [2/9] D-Pad DOWN:            $", 0
+msg_prompt_left:  db "  [3/9] D-Pad LEFT:            $", 0
+msg_prompt_right: db "  [4/9] D-Pad RIGHT:           $", 0
+msg_prompt_a:     db "  [5/9] Button A:              $", 0
+msg_prompt_b:     db "  [6/9] Button B:              $", 0
+msg_prompt_sel:   db "  [7/9] SELECT:                $", 0
+msg_prompt_start: db "  [8/9] START:                 $", 0
+msg_prompt_sound: db "  [9/9] PC Speaker Sound (Y/N): $", 0
+msg_sound_on:     db "ON", 0Dh, 0Ah, "$"
+msg_sound_off:    db "OFF", 0Dh, 0Ah, "$"
 
 msg_kn_up:    db "UP ARROW", 0Dh, 0Ah, "$"
 msg_kn_down:  db "DOWN ARROW", 0Dh, 0Ah, "$"
@@ -953,7 +1015,9 @@ ini_template_part1:
     db "scaling = center", 0Dh, 0Ah
     db "palette = pocket", 0Dh, 0Ah
     db "vsync = 1", 0Dh, 0Ah
-    db "sound = 1", 0Dh, 0Ah
+    db "sound = "
+ini_sound_char:
+    db "1", 0Dh, 0Ah
     db 0Dh, 0Ah
     db "[input]", 0Dh, 0Ah
     db "key_up = UP", 0Dh, 0Ah

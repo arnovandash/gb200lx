@@ -85,6 +85,7 @@ Launch `/SETUP` directly on the HP 200LX or via `make setup` in DOSBox-X:
 C:\GAMES> GAME.EXE /SETUP
 ```
 - Select an action and press the desired key to capture its hardware scancode.
-- Toggle palettes and save directly back to `GB200LX.INI` (press `ENTER` to save and start, or `ESC` to cancel).
+- Answer `[9/9] PC Speaker Sound (Y/N)` (`Y`/`1`/`Enter` = On, `N`/`0` = Off) to enable or disable sound.
+- Press `ENTER` to save settings directly to `GB200LX.INI` and start the game, or `ESC` to cancel.
 
 For automated verification, passing `/t` (used by `make test`) runs 120 frames, dumps CGA VRAM (`0xB800`) to `CGA_VRAM.BIN`, and exits cleanly to DOS.
