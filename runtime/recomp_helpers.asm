@@ -35,7 +35,7 @@ helper_push_af:
 
     ; Push onto GB stack: SP decrements by 2.
     ; Byte at [di-2] = F (AH), byte at [di-1] = A (AL)
-    sub     di, 2
+    lea     di, [di - 2]
     mov     [di], ah
     mov     [di+1], al
     popf
@@ -48,7 +48,7 @@ global helper_pop_af
 helper_pop_af:
     mov     ah, [di]            ; F
     mov     al, [di+1]          ; A
-    add     di, 2
+    lea     di, [di + 2]
     and     ah, 0F0h            ; Keep only upper 4 flag bits
 
     push    bp

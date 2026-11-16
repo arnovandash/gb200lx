@@ -22,7 +22,7 @@ def detect_rst_table_dispatchers(disasm: SM83Disassembler) -> Tuple[Set[int], Se
     """
     Detect RST vectors in Bank 0 (0x00, 0x08, ..., 0x38) that implement an inline
     jump-table dispatcher (popping the caller return address via POP HL/DE/BC and
-    tail-jumping via JP (HL)).
+    tail-jumping via JP (HL), optionally following an initial unconditional JP/JR).
     Returns (rst_table_vecs, pop_ret_jp_hl_addrs).
     """
     rst_vecs: Set[int] = set()
@@ -30,20 +30,36 @@ def detect_rst_table_dispatchers(disasm: SM83Disassembler) -> Tuple[Set[int], Se
     for vec in [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38]:
         cur = vec
         saw_pop = False
-        for _ in range(16):
+        for step in range(20):
             ins = disasm.decode_instr(0, cur)
             m = ins.mnemonic
-            # The return-address POP must occur within the first 8 bytes of the RST vector
-            if m in ("POP HL", "POP DE", "POP BC") and cur < vec + 8:
+            # The return-address POP must occur within the first 6 instructions
+            if m in ("POP HL", "POP DE", "POP BC") and step < 6:
                 saw_pop = True
             if m == "JP (HL)" and saw_pop:
                 rst_vecs.add(vec)
                 pop_jp_hl_addrs.add(cur)
                 break
-            if ins.is_unconditional_jump or m in ("RET", "RETI", "NOP"):
+            if ins.is_unconditional_jump and ins.target_addr is not None and m != "JP (HL)":
+                cur = ins.target_addr
+                continue
+            if m in ("RET", "RETI", "NOP") or m.startswith("RST "):
                 break
             cur += max(1, ins.length)
     return rst_vecs, pop_jp_hl_addrs
+
+
+def detect_hram_dma_routine(disasm: SM83Disassembler) -> int:
+    """
+    Locate the ROM source routine in Bank 0 that performs OAM DMA (`LD A, nn; LDH (0x46), A`)
+    and is copied into HRAM (`0xFF80..0xFFFE`) at startup.
+    """
+    for a in range(2, 0x4000 - 2):
+        if disasm.read_u8(0, a) == 0xE0 and disasm.read_u8(0, a + 1) == 0x46:
+            if disasm.read_u8(0, a - 2) == 0x3E:
+                return a - 2
+            return a
+    return 0x3F92
 
 
 def read_inline_jump_table(disasm: SM83Disassembler, bank: int, table_addr: int) -> List[int]:
@@ -56,7 +72,7 @@ def read_inline_jump_table(disasm: SM83Disassembler, bank: int, table_addr: int)
     targets: List[int] = []
     while cur < limit and len(targets) < 128:
         w = disasm.read_u16(bank, cur)
-        if w < 0x0150 or w >= 0x8000:
+        if w < 0x0008 or (0x0104 <= w < 0x0150) or w >= 0x8000:
             break
         if table_addr < w < limit and ((bank == 0 and w < 0x4000) or (bank > 0 and w >= 0x4000)):
             limit = w
@@ -65,7 +81,7 @@ def read_inline_jump_table(disasm: SM83Disassembler, bank: int, table_addr: int)
     return targets
 
 
-def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int]):
+def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int], hram_dma_addr: int):
     """
     Perform validated control-flow and jump-table discovery across all banks.
     Never pollutes code labels with interior operand bytes or graphics/level data.
@@ -76,7 +92,7 @@ def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int]):
     bn_to_b0_set: Set[int] = set()
 
     # 1. Trace Bank 0 from hardware entry vectors
-    b0_seeds = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x60, 0x100, 0x150, 0x3F92]
+    b0_seeds = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x100, 0x150, hram_dma_addr]
     worklist: List[int] = list(b0_seeds)
     for a in b0_seeds:
         bank_labels[0].add(a)
@@ -84,45 +100,67 @@ def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int]):
     b0_vis: Set[int] = set()
     b0_interior: Set[int] = set()
 
-    while worklist:
-        addr = worklist.pop()
-        if addr in b0_vis or not (0 <= addr < 0x4000):
-            continue
-        b0_vis.add(addr)
+    def trace_b0_worklist(wl: List[int]):
+        while wl:
+            addr = wl.pop()
+            if addr in b0_vis or addr in b0_interior or not (0 <= addr < 0x4000):
+                continue
+            b0_vis.add(addr)
 
-        ins = disasm.decode_instr(0, addr)
-        for k in range(1, ins.length):
-            b0_interior.add(addr + k)
-        m = ins.mnemonic
+            ins = disasm.decode_instr(0, addr)
+            for k in range(1, ins.length):
+                b0_interior.add(addr + k)
+            m = ins.mnemonic
 
-        if m.startswith("RST "):
-            vec = int(m[4:], 16)
-            if vec in rst_table_vecs:
-                tbl_targets = read_inline_jump_table(disasm, 0, addr + ins.length)
-                for t in tbl_targets:
-                    jp_hl_targets[0].add(t)
-                    if t < 0x4000:
-                        bank_labels[0].add(t)
-                        worklist.append(t)
-                    elif t < 0x8000:
-                        b0_to_bn_set.add(t)
+            if m.startswith("RST "):
+                vec = int(m[4:], 16)
+                if vec in rst_table_vecs:
+                    tbl_targets = read_inline_jump_table(disasm, 0, addr + ins.length)
+                    for t in tbl_targets:
+                        jp_hl_targets[0].add(t)
+                        if t < 0x4000:
+                            bank_labels[0].add(t)
+                            wl.append(t)
+                        elif t < 0x8000:
+                            b0_to_bn_set.add(t)
+                    continue
+
+            if m == "JP (HL)":
+                for back in (6, 10):
+                    if addr >= back and disasm.read_u8(0, addr - back) == 0x21 and disasm.read_u8(0, addr - back + 3) == 0xCD:
+                        tbl = disasm.read_u16(0, addr - back + 1)
+                        if 0x0150 <= tbl < 0x4000:
+                            t_start = tbl + 2 if disasm.read_u16(0, tbl) == 0 else tbl
+                            for t in read_inline_jump_table(disasm, 0, t_start):
+                                jp_hl_targets[0].add(t)
+                                if t < 0x4000:
+                                    bank_labels[0].add(t)
+                                    wl.append(t)
+                                elif t < 0x8000:
+                                    b0_to_bn_set.add(t)
                 continue
 
-        if m == "JP (HL)":
-            continue
+            # Detect `LD BC/DE/HL, imm16; PUSH BC/DE/HL` synthetic return-address pushes (e.g. LZ77 loop return)
+            if ins.length == 3 and m.startswith(("LD BC, 0x", "LD DE, 0x", "LD HL, 0x")):
+                rr = m[3:5]
+                imm = int(m.split(", ")[1], 16)
+                next_ins = disasm.decode_instr(0, addr + 3)
+                if next_ins.mnemonic == f"PUSH {rr}" and 0x0150 <= imm < 0x4000:
+                    bank_labels[0].add(imm)
+                    wl.append(imm)
 
-        if ins.target_addr is not None:
-            t = ins.target_addr
-            if t < 0x4000:
-                bank_labels[0].add(t)
-                worklist.append(t)
-            elif t < 0x8000:
-                b0_to_bn_set.add(t)
+            if ins.target_addr is not None:
+                t = ins.target_addr
+                if t < 0x4000:
+                    bank_labels[0].add(t)
+                    wl.append(t)
+                elif t < 0x8000:
+                    b0_to_bn_set.add(t)
 
-        if not ins.is_unconditional_jump and m not in ("RET", "RETI"):
-            worklist.append(addr + ins.length)
+            if not ins.is_unconditional_jump and m not in ("RET", "RETI"):
+                wl.append(addr + ins.length)
 
-    # Remove any seed that turned out to be an interior operand byte of a real instruction
+    trace_b0_worklist(worklist)
     bank_labels[0] -= b0_interior
 
     # 2. Helper to validate and trace a candidate function entry in Bank 1..3
@@ -133,6 +171,7 @@ def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int]):
         labels: Set[int] = {start_t}
         b0_refs: Set[int] = set()
         tbl_addrs: Set[int] = set()
+        rst_jp_targets: Set[int] = set()
 
         while wl:
             a = wl.pop()
@@ -143,10 +182,25 @@ def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int]):
             vis.add(a)
             ins = disasm.decode_instr(b, a)
             m = ins.mnemonic
-            if m.startswith("DB ") or m == "STOP" or m.startswith("RST ") or m.startswith("LD SP"):
+            if m.startswith("DB ") or m == "STOP" or m == "RST 0x38" or m.startswith("LD SP"):
                 return None
             for k in range(1, ins.length):
                 interior.add(a + k)
+
+            if m.startswith("RST "):
+                vec = int(m[4:], 16)
+                if vec in rst_table_vecs:
+                    tbl_targets = read_inline_jump_table(disasm, b, a + ins.length)
+                    if not tbl_targets:
+                        return None
+                    for t in tbl_targets:
+                        rst_jp_targets.add(t)
+                        if 0x4000 <= t < 0x8000:
+                            labels.add(t)
+                            wl.append(t)
+                        elif 0x0150 <= t < 0x4000 and t not in b0_interior:
+                            b0_refs.add(t)
+                    continue
 
             if m == "JP (HL)":
                 if disasm.read_u8(b, a - 3) == 0xCD and disasm.read_u8(b, a - 6) == 0x21:
@@ -158,7 +212,7 @@ def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int]):
             if ins.target_addr is not None:
                 t = ins.target_addr
                 if t < 0x4000:
-                    if t in b0_interior or t < 0x0150:
+                    if t in b0_interior or (t < 0x0150 and not m.startswith("RST ")):
                         return None
                     b0_refs.add(t)
                 elif t < 0x8000:
@@ -172,69 +226,65 @@ def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int]):
 
         if (labels & interior) or (vis & interior):
             return None
-        return vis, interior, labels, b0_refs, tbl_addrs
+        return vis, interior, labels, b0_refs, tbl_addrs, rst_jp_targets
 
-    # 3. Trace Banks 1..3 from validated cross-bank entry points
-    for b in [1, 2, 3]:
-        b_interior: Set[int] = set()
-        pending_tables: Set[int] = set()
-        for t in sorted(b0_to_bn_set):
-            bank_labels[b].add(t)
-            res = trace_bank_subgraph(b, t)
-            if res is not None:
-                vis, interior, labels, b0_refs, tbl_addrs = res
-                b_interior |= interior
-                bank_labels[b] |= labels
-                pending_tables |= tbl_addrs
-                for r in b0_refs:
-                    bn_to_b0_set.add(r)
-                    bank_labels[0].add(r)
-
-        # Also trace validated JP (HL) table entries in Bank b transitively
-        seen_tables: Set[int] = set()
-        while pending_tables:
-            tbl = min(pending_tables)
-            pending_tables.remove(tbl)
-            if tbl in seen_tables:
-                continue
-            seen_tables.add(tbl)
-            for i in range(32):
-                w = disasm.read_u16(b, tbl + i * 2)
-                if not (0x4000 <= w < 0x8000):
-                    break
-                res = trace_bank_subgraph(b, w)
+    # 3. Trace Banks 1..3 and Bank 0 cross-bank references iteratively to fixed point
+    for _round in range(3):
+        prev_b0_to_bn = len(b0_to_bn_set)
+        prev_bn_to_b0 = len(bn_to_b0_set)
+        for b in [1, 2, 3]:
+            b_interior: Set[int] = set()
+            pending_tables: Set[int] = set()
+            for t in sorted(b0_to_bn_set):
+                bank_labels[b].add(t)
+                res = trace_bank_subgraph(b, t)
                 if res is not None:
-                    vis, interior, labels, b0_refs, more_tbls = res
+                    vis, interior, labels, b0_refs, tbl_addrs, rst_jp_targets = res
                     b_interior |= interior
                     bank_labels[b] |= labels
-                    jp_hl_targets[b].add(w)
-                    pending_tables |= (more_tbls - seen_tables)
+                    pending_tables |= tbl_addrs
+                    jp_hl_targets[b] |= rst_jp_targets
                     for r in b0_refs:
                         bn_to_b0_set.add(r)
                         bank_labels[0].add(r)
-                else:
-                    break
 
-        bank_labels[b] -= b_interior
+            # Also trace validated JP (HL) table entries in Bank b transitively
+            seen_tables: Set[int] = set()
+            while pending_tables:
+                tbl = min(pending_tables)
+                pending_tables.remove(tbl)
+                if tbl in seen_tables:
+                    continue
+                seen_tables.add(tbl)
+                for i in range(32):
+                    w = disasm.read_u16(b, tbl + i * 2)
+                    if not (0x4000 <= w < 0x8000):
+                        break
+                    res = trace_bank_subgraph(b, w)
+                    if res is not None:
+                        vis, interior, labels, b0_refs, more_tbls, rst_jp_targets = res
+                        b_interior |= interior
+                        bank_labels[b] |= labels
+                        jp_hl_targets[b].add(w)
+                        jp_hl_targets[b] |= rst_jp_targets
+                        pending_tables |= (more_tbls - seen_tables)
+                        for r in b0_refs:
+                            bn_to_b0_set.add(r)
+                            bank_labels[0].add(r)
+                    else:
+                        break
 
-    # 4. Trace any newly discovered bn_to_b0 entry points in Bank 0
-    new_b0 = list(bn_to_b0_set - b0_vis)
-    while new_b0:
-        addr = new_b0.pop()
-        if addr in b0_vis or addr in b0_interior or not (0 <= addr < 0x4000):
-            continue
-        b0_vis.add(addr)
-        ins = disasm.decode_instr(0, addr)
-        for k in range(1, ins.length):
-            b0_interior.add(addr + k)
-        m = ins.mnemonic
-        if ins.target_addr is not None and ins.target_addr < 0x4000 and ins.target_addr not in b0_interior:
-            bank_labels[0].add(ins.target_addr)
-            new_b0.append(ins.target_addr)
-        if not ins.is_unconditional_jump and m not in ("RET", "RETI", "JP (HL)"):
-            new_b0.append(addr + ins.length)
+            bank_labels[b] -= b_interior
 
-    bank_labels[0] -= b0_interior
+        # 4. Trace any newly discovered bn_to_b0 entry points in Bank 0
+        new_b0 = list(bn_to_b0_set - b0_vis)
+        if new_b0:
+            trace_b0_worklist(new_b0)
+            bank_labels[0] -= b0_interior
+
+        if len(b0_to_bn_set) == prev_b0_to_bn and len(bn_to_b0_set) == prev_bn_to_b0:
+            break
+
     return bank_labels, jp_hl_targets, b0_to_bn_set, bn_to_b0_set
 
 
@@ -282,11 +332,13 @@ def main():
 
     disasm = SM83Disassembler(rom_bytes)
 
-    # 1. Detect inline RST jump-table dispatchers & run control-flow discovery
+    # 1. Detect inline RST jump-table dispatchers, HRAM DMA, & run control-flow discovery
     rst_table_vecs, pop_jp_hl_addrs = detect_rst_table_dispatchers(disasm)
+    hram_dma_addr = detect_hram_dma_routine(disasm)
     print(f"[gb200lx] Detected inline jump-table RST vectors: {[hex(v) for v in sorted(rst_table_vecs)]}")
+    print(f"[gb200lx] Detected HRAM OAM DMA source routine at: 0x{hram_dma_addr:04x}")
 
-    bank_labels, jp_hl_targets, b0_to_bn_set, bn_to_b0_set = discover_control_flow(disasm, rst_table_vecs)
+    bank_labels, jp_hl_targets, b0_to_bn_set, bn_to_b0_set = discover_control_flow(disasm, rst_table_vecs, hram_dma_addr)
 
     b0_to_bn = sorted(list(b0_to_bn_set))
     b0_to_bn_idx = {t: i for i, t in enumerate(b0_to_bn)}
@@ -333,12 +385,13 @@ def main():
 
     disp_b0_lines.extend([
         "",
-        "; Far dispatch helper for Bank 0",
+        "; Far dispatch helper for Bank 0 (preserves CPU flags across far return)",
         "global do_far_dispatch",
         "do_far_dispatch:",
         "    mov     bp, sp",
         "    call    far [bp]",
-        "    add     sp, 4",
+        "    pop     bp",
+        "    pop     bp",
         "    ret",
         "",
         "; Indirect jump dispatcher JP (HL) for Bank 0",
@@ -351,7 +404,7 @@ def main():
             disp_b0_lines.append(f"    je  near loc_00_{t:04x}")
         else:
             disp_b0_lines.append(f"    je  near dispatch_call_{t:04x}")
-    disp_b0_lines.append("    add di, 2")
+    disp_b0_lines.append("    lea di, [di + 2]")
     disp_b0_lines.append("    ret")
     disp_b0_lines.append("")
     disp_b0_lines.append("; Dispatchers for Bank 0 calling Banks 1..3")
@@ -402,7 +455,7 @@ def main():
                 disp_bn_lines.append(f"    je  near loc_{b:02x}_{t:04x}")
             elif t in bn_to_b0_idx:
                 disp_bn_lines.append(f"    je  near .jp_b0_{t:04x}")
-        disp_bn_lines.append("    add di, 2")
+        disp_bn_lines.append("    lea di, [di + 2]")
         disp_bn_lines.append("    ret")
         for t in sorted(jp_hl_targets[b]):
             if t < 0x4000 and t in bn_to_b0_idx:
@@ -422,7 +475,8 @@ def main():
             disp_bn_lines.append(f"    push word (32 + {idx * 4})")
             disp_bn_lines.append("    mov bp, sp")
             disp_bn_lines.append("    call far [bp]")
-            disp_bn_lines.append("    add sp, 4")
+            disp_bn_lines.append("    pop bp")
+            disp_bn_lines.append("    pop bp")
             disp_bn_lines.append("    pop bp")
             disp_bn_lines.append("    ret")
 
@@ -481,6 +535,63 @@ def main():
                 curr = next_c
                 continue
 
+            # Synthetic return-address push: `LD BC/DE/HL, imm16; PUSH BC/DE/HL` where imm16 is a known code label
+            if (instr.length == 3
+                    and instr.mnemonic.startswith(("LD BC, 0x", "LD DE, 0x", "LD HL, 0x"))
+                    and (curr + 3) not in lbl_set):
+                rr = instr.mnemonic[3:5]
+                imm = int(instr.mnemonic.split(", ")[1], 16)
+                next_ins = disasm.decode_instr(b, curr + 3)
+                if next_ins.mnemonic == f"PUSH {rr}" and imm in lbl_set:
+                    xreg = {"BC": "bx", "DE": "dx", "HL": "cx"}[rr]
+                    lbl_cont = f".push_ret_{curr:04x}"
+                    lines.append(f"    mov {xreg}, 0{imm:04X}h")
+                    lines.append("    lea di, [di - 2]")
+                    lines.append(f"    mov [di], {xreg}")
+                    lines.append(f"    call near {lbl_cont}")
+                    lines.append(f"    jmp near {cg.label_name(b, imm)}")
+                    lines.append(f"{lbl_cont}:")
+                    curr = curr + 4
+                    continue
+
+            # Inline RST jump-table call (e.g. RST 0x28 or RST 0x00) in any bank 0..3:
+            # Computes target = word [next_c + A * 2] and dispatches via current bank's helper_dispatch_jp_hl!
+            if instr.mnemonic.startswith("RST ") and int(instr.mnemonic[4:], 16) in rst_table_vecs:
+                lines.append(f"    mov cx, 0{next_c:04X}h")
+                lines.append("    add al, al")
+                lines.append("    mov dl, al")
+                lines.append("    mov dh, 000h")
+                lines.append("    add cx, dx")
+                lines.append("    mov si, cx")
+                lines.append("    mov dl, [si]")
+                lines.append("    inc cx")
+                lines.append("    mov si, cx")
+                lines.append("    mov dh, [si]")
+                lines.append("    mov cx, dx")
+                lines.append("    mov si, cx")
+                lines.append("    jmp near helper_dispatch_jp_hl")
+                curr = next_c
+                continue
+
+            # Generic interrupt-driven spin-loop yield:
+            # A 3-instruction loop `LDH/LD A, (RAM) -> AND/OR A, A -> JR Z, loop_start` modifies no memory or
+            # registers and can only exit when an ISR (VBlank/Timer) updates the polled RAM byte.
+            if instr.mnemonic.startswith("JR Z, ") and instr.target_addr is not None and curr - 4 <= instr.target_addr <= curr - 3:
+                t_spin = instr.target_addr
+                i0 = disasm.decode_instr(b, t_spin)
+                i1 = disasm.decode_instr(b, t_spin + i0.length)
+                if (t_spin + i0.length + i1.length == curr
+                        and (i0.mnemonic.startswith("LDH A, (0x") or i0.mnemonic.startswith("LD A, (0xC") or i0.mnemonic.startswith("LD A, (0xD"))
+                        and i1.mnemonic in ("AND A, A", "OR A, A")):
+                    cg.labels.add((b, t_spin))
+                    lbl_done = f".spin_exit_{curr:04x}"
+                    lines.append(f"    jnz short {lbl_done}")
+                    lines.append("    call helper_halt")
+                    lines.append(f"    jmp near {cg.label_name(b, t_spin)}")
+                    lines.append(f"{lbl_done}:")
+                    curr = next_c
+                    continue
+
             # Route cross-bank CALL and cross-bank JP (including conditional CALL cc / JP cc)
             if (instr.is_call or instr.is_branch) and instr.target_addr is not None:
                 t = instr.target_addr
@@ -493,7 +604,7 @@ def main():
                     if t in b0_to_bn_idx:
                         cross_call_line = f"call near dispatch_call_{t:04x}"
                     elif t >= 0xFF80:
-                        cross_call_line = "call near loc_00_3f92"
+                        cross_call_line = f"call near loc_00_{hram_dma_addr:04x}"
                     else:
                         curr = next_c
                         continue
@@ -514,16 +625,16 @@ def main():
                         if is_cond:
                             lbl_skip = f".skip_cc_{curr:04x}"
                             lines.append(f"    {neg_jcc} short {lbl_skip}")
-                            lines.append("    sub di, 2")
+                            lines.append("    lea di, [di - 2]")
                             lines.append(f"    mov word [di], {next_addr}")
                             lines.append(f"    {cross_call_line}")
                             lines.append(f"{lbl_skip}:")
                         else:
-                            lines.append("    sub di, 2")
+                            lines.append("    lea di, [di - 2]")
                             lines.append(f"    mov word [di], {next_addr}")
                             lines.append(f"    {cross_call_line}")
                     else:
-                        # Cross-bank JP / JP cc (tail jump: target will execute add di, 2; ret)
+                        # Cross-bank JP / JP cc (tail jump: target will execute lea di, [di + 2]; ret)
                         if is_cond:
                             lbl_skip = f".skip_cj_{curr:04x}"
                             lines.append(f"    {neg_jcc} short {lbl_skip}")
@@ -572,7 +683,7 @@ def main():
         with open(f"{OUT_DIR}/stubs_b{b}.asm", "w") as f:
             f.write("bits 16\ncpu 186\n\n")
             for m in sorted(missing):
-                f.write(f"global {m}\n{m}:\n    add di, 2\n    ret\n")
+                f.write(f"global {m}\n{m}:\n    lea di, [di + 2]\n    ret\n")
         print(f"[gb200lx] Bank {b}: {len(defined)} defined, {len(missing)} stubs")
 
     # 5. Assemble Pass 1 to get exact segment paragraph sizes

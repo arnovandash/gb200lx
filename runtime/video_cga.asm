@@ -559,8 +559,8 @@ cga_render_gb_frame:
     call    helper_update_bgp
     mov     al, [ds:0FF40h]
 
-    ; Setup ES = CGA VRAM segment
-    mov     bx, CGA_VRAM_SEG
+    ; Setup ES = CS for rendering into offscreen backbuffer
+    mov     bx, cs
     mov     es, bx
 
     ; Determine BG tile map base: bit 3 of LCDC
@@ -609,10 +609,10 @@ cga_render_gb_frame:
     mov     [cs:render_scy], al
     mov     [cs:render_scx], ah
 
-    ; Calculate VRAM destination pointer for line Y
+    ; Calculate backbuffer destination pointer for line Y
     mov     bx, cx
     shl     bx, 1
-    mov     di, [cs:cga_scanline_offsets + bx] ; ES:DI = CGA scanline destination
+    mov     di, [cs:backbuffer_scanline_offsets + bx] ; ES:DI = backbuffer scanline destination
 
     ; bg_y = (Y + SCY) & 0xFF
     mov     al, cl
@@ -704,11 +704,125 @@ cga_render_gb_frame:
     jb      near .line_loop
 
     ; --------------------------------------------------------------------------
+    ; Render Game Boy Window Layer (if LCDC bit 5 is enabled)
+    ; --------------------------------------------------------------------------
+    mov     al, [ds:0FF40h]
+    test    al, 20h             ; Bit 5: Window enable
+    jz      near .skip_window
+
+    mov     word [cs:render_map_base], 09800h
+    test    al, 40h             ; Bit 6: Window tile map (0=9800h, 1=9C00h)
+    jz      .win_map_ok
+    mov     word [cs:render_map_base], 09C00h
+.win_map_ok:
+    mov     al, [ds:0FF4Ah]     ; WY
+    cmp     al, GB_SCREEN_HEIGHT
+    jae     near .skip_window
+    xor     ch, ch
+    mov     cl, al              ; CX = start screen line Y = WY
+
+    mov     al, [ds:0FF4Bh]     ; WX
+    cmp     al, 167
+    jae     near .skip_window
+    cmp     al, 7
+    jae     .wx_sub7
+    mov     al, 7
+.wx_sub7:
+    sub     al, 7
+    shr     al, 3
+    mov     [cs:render_win_scol], al
+
+.win_line_loop:
+    push    cx
+
+    mov     bx, cx
+    shl     bx, 1
+    mov     di, [cs:backbuffer_scanline_offsets + bx]
+    xor     ax, ax
+    mov     al, [cs:render_win_scol]
+    shl     ax, 1               ; * 2 bytes per tile column
+    add     di, ax
+
+    mov     al, cl
+    sub     al, [ds:0FF4Ah]     ; win_y = Y - WY
+    mov     ah, al
+    and     ah, 07h
+    shl     ah, 1
+    mov     [cs:render_fine_y], ah
+
+    shr     al, 3
+    xor     ah, ah
+    shl     ax, 5
+    add     ax, [cs:render_map_base]
+    mov     [cs:render_row_base], ax
+
+    xor     bp, bp
+    mov     bl, [cs:render_win_scol]
+    xor     bh, bh
+    mov     bp, bx              ; BP = screen tile column (start_col..19)
+.win_tile_loop:
+    mov     ax, bp
+    xor     bx, bx
+    mov     bl, [cs:render_win_scol]
+    sub     ax, bx              ; win_col = BP - start_col
+    mov     si, [cs:render_row_base]
+    add     si, ax
+    mov     al, [ds:si]
+
+    cmp     byte [cs:render_unsigned_tile], 1
+    je      .win_unsigned_tile
+    cbw
+    shl     ax, 4
+    add     ax, 09000h
+    jmp     short .win_tile_addr_done
+.win_unsigned_tile:
+    xor     ah, ah
+    shl     ax, 4
+    add     ax, 08000h
+.win_tile_addr_done:
+    xor     bx, bx
+    mov     bl, [cs:render_fine_y]
+    mov     si, ax
+    add     si, bx
+
+    mov     al, [ds:si]
+    mov     ah, [ds:si+1]
+
+    mov     bl, al
+    shr     bl, 4
+    mov     bh, ah
+    and     bh, 0F0h
+    or      bl, bh
+    xor     bh, bh
+    mov     dl, [cs:dmg_cga_nibble_table + bx]
+
+    mov     bl, al
+    and     bl, 0Fh
+    mov     bh, ah
+    shl     bh, 4
+    or      bl, bh
+    xor     bh, bh
+    mov     dh, [cs:dmg_cga_nibble_table + bx]
+
+    mov     [es:di], dx
+    add     di, 2
+
+    inc     bp
+    cmp     bp, 20
+    jb      .win_tile_loop
+
+    pop     cx
+    inc     cx
+    cmp     cx, GB_SCREEN_HEIGHT
+    jb      near .win_line_loop
+
+.skip_window:
+    ; --------------------------------------------------------------------------
     ; Render OAM Sprites (0xFE00..0xFE9F, 40 sprites) if LCDC bit 1 is enabled
     ; --------------------------------------------------------------------------
     mov     al, [ds:0FF40h]
     test    al, 02h
-    jz      near .render_done
+    jz      near .blit_backbuffer
 
     mov     byte [cs:render_spr_h], 8
     test    al, 04h             ; Bit 2: 8x16 sprites
@@ -763,11 +877,11 @@ cga_render_gb_frame:
     cmp     al, 144
     jae     near .spr_row_next  ; unsigned >= 144 also catches negative wrap!
 
-    ; Calculate CGA scanline pointer for screen_y
+    ; Calculate backbuffer scanline pointer for screen_y
     xor     bx, bx
     mov     bl, al
     shl     bx, 1
-    mov     bp, [cs:cga_scanline_offsets + bx]
+    mov     bp, [cs:backbuffer_scanline_offsets + bx]
 
     ; Effective row (handle Y-flip bit 6)
     mov     al, cl
@@ -874,6 +988,27 @@ cga_render_gb_frame:
     dec     cx
     jnz     near .spr_loop
 
+.blit_backbuffer:
+    ; Blit completed 160x144 composited frame from cga_backbuffer to CGA VRAM (0xB800)
+    push    ds
+    mov     ax, CGA_VRAM_SEG
+    mov     es, ax
+    mov     ax, cs
+    mov     ds, ax
+
+    mov     si, cga_backbuffer
+    xor     bx, bx              ; BX = scanline index (0..143) * 2
+    cld
+.blit_line_loop:
+    mov     di, [cs:cga_scanline_offsets + bx]
+    mov     cx, (GB_BYTES_PER_LINE / 2) ; 20 words = 40 bytes
+    rep     movsw
+    add     bx, 2
+    cmp     bx, GB_SCREEN_HEIGHT * 2
+    jb      .blit_line_loop
+
+    pop     ds
+
 .render_done:
     pop     es
     pop     bp
@@ -885,6 +1020,17 @@ cga_render_gb_frame:
     pop     ax
     popf
     ret
+
+    align 16
+cga_backbuffer:
+    times (GB_BYTES_PER_LINE * GB_SCREEN_HEIGHT) db 0
+
+backbuffer_scanline_offsets:
+%assign y 0
+%rep GB_SCREEN_HEIGHT
+    dw cga_backbuffer + (y * GB_BYTES_PER_LINE)
+%assign y y+1
+%endrep
 
 ; Rendering scratch variables in CS
 render_map_base:        dw 09800h
@@ -903,3 +1049,4 @@ render_spr_x:           db 0
 render_spr_tile:        db 0
 render_spr_attr:        db 0
 render_spr_pal:         db 0
+render_win_scol:        db 0

@@ -44,7 +44,7 @@ entry:
     jmp     .no_cmd_params
 
 .enable_auto_exit:
-    mov     word [auto_exit_frames], 60 ; Run 60 frames (~1 sec) in test mode
+    mov     word [auto_exit_frames], 120 ; Run 120 frames (~2 sec) in test mode
 
 .no_cmd_params:
     ; 1. Initialize Configuration from GB200LX.INI or interactive /SETUP

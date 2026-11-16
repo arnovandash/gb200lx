@@ -264,7 +264,7 @@ class SM83Disassembler:
             return instr
 
         # JP cc, nn
-        if (op & 0xC7) == 0xC2:
+        if op in (0xC2, 0xCA, 0xD2, 0xDA):
             cond = ["NZ", "Z", "NC", "C"][(op >> 3) & 0x03]
             target = self.read_u16(bank, addr + 1)
             instr = SM83Instruction(bank, addr, op, 3, f"JP {cond}, 0x{target:04X}", 12)
@@ -288,7 +288,7 @@ class SM83Disassembler:
             return instr
 
         # CALL cc, nn
-        if (op & 0xC7) == 0xC4:
+        if op in (0xC4, 0xCC, 0xD4, 0xDC):
             cond = ["NZ", "Z", "NC", "C"][(op >> 3) & 0x03]
             target = self.read_u16(bank, addr + 1)
             instr = SM83Instruction(bank, addr, op, 3, f"CALL {cond}, 0x{target:04X}", 12)
@@ -305,7 +305,7 @@ class SM83Disassembler:
             instr = SM83Instruction(bank, addr, op, 1, "RETI", 16)
             instr.is_ret = True
             return instr
-        if (op & 0xC7) == 0xC0:
+        if op in (0xC0, 0xC8, 0xD0, 0xD8):
             cond = ["NZ", "Z", "NC", "C"][(op >> 3) & 0x03]
             instr = SM83Instruction(bank, addr, op, 1, f"RET {cond}", 8)
             instr.is_ret = True
@@ -522,6 +522,7 @@ class CodeGenerator80186:
                     return [f"{x86_alu} al, {imm}"]
 
         # 4. INC / DEC 8-bit & 16-bit
+        # Note: In SM83, 16-bit INC/DEC rr preserves ALL CPU flags (ZF and CF)!
         if m.startswith("INC "):
             r = m[4:]
             if r in REG8_TO_X86:
@@ -529,7 +530,11 @@ class CodeGenerator80186:
             elif r == "(HL)":
                 return ["mov si, cx", "inc byte [si]"]
             elif r in REG16_TO_X86:
-                return [f"inc {REG16_TO_X86[r]}"]
+                xr = REG16_TO_X86[r]
+                if xr in ("bx", "di"):
+                    return [f"lea {xr}, [{xr} + 1]"]
+                else:
+                    return ["lahf", f"inc {xr}", "sahf"]
 
         if m.startswith("DEC "):
             r = m[4:]
@@ -538,13 +543,24 @@ class CodeGenerator80186:
             elif r == "(HL)":
                 return ["mov si, cx", "dec byte [si]"]
             elif r in REG16_TO_X86:
-                return [f"dec {REG16_TO_X86[r]}"]
+                xr = REG16_TO_X86[r]
+                if xr in ("bx", "di"):
+                    return [f"lea {xr}, [{xr} - 1]"]
+                else:
+                    return ["lahf", f"dec {xr}", "sahf"]
 
-        # ADD HL, rr
+        # ADD HL, rr: In SM83, ADD HL, rr preserves ZF and updates CF!
         if m.startswith("ADD HL, "):
             rr = m[8:]
             if rr in REG16_TO_X86:
-                return [f"add cx, {REG16_TO_X86[rr]}"]
+                xr = REG16_TO_X86[rr]
+                return [
+                    "lahf",
+                    "and ah, 0FEh",
+                    f"add cx, {xr}",
+                    "adc ah, 0",
+                    "sahf"
+                ]
 
         # ADD SP, e
         if m.startswith("ADD SP, "):
@@ -554,14 +570,14 @@ class CodeGenerator80186:
             else:
                 return [f"sub di, {-e}"]
 
-        # 5. PUSH / POP
+        # 5. PUSH / POP (use lea di so CPU flags CF/ZF are never modified)
         if m.startswith("PUSH "):
             rr = m[5:]
             if rr == "AF":
                 return ["call helper_push_af"]
             elif rr in REG16_TO_X86:
                 xreg = REG16_TO_X86[rr]
-                return ["sub di, 2", f"mov [di], {xreg}"]
+                return ["lea di, [di - 2]", f"mov [di], {xreg}"]
 
         if m.startswith("POP "):
             rr = m[4:]
@@ -569,18 +585,19 @@ class CodeGenerator80186:
                 return ["call helper_pop_af"]
             elif rr in REG16_TO_X86:
                 xreg = REG16_TO_X86[rr]
-                return [f"mov {xreg}, [di]", "add di, 2"]
+                return [f"mov {xreg}, [di]", "lea di, [di + 2]"]
 
         # 6. CB-prefix operations
+        # In SM83, BIT b, r sets ZF and preserves CF (x86 test clears CF, so restore CF via lahf/rcr)
         if m.startswith("BIT "):
             parts = m[4:].split(", ")
             bit = int(parts[0])
             r = parts[1]
             mask = f"0{(1 << bit):02X}h"
             if r in REG8_TO_X86:
-                return [f"test {REG8_TO_X86[r]}, {mask}"]
+                return ["lahf", f"test {REG8_TO_X86[r]}, {mask}", "rcr ah, 1"]
             elif r == "(HL)":
-                return ["mov si, cx", f"test byte [si], {mask}"]
+                return ["mov si, cx", "lahf", f"test byte [si], {mask}", "rcr ah, 1"]
 
         if m.startswith("SET "):
             parts = m[4:].split(", ")
@@ -610,22 +627,34 @@ class CodeGenerator80186:
             elif r == "(HL)":
                 return ["mov si, cx", "rol byte [si], 4", "test byte [si], 0FFh"]
 
-        cb_rotates = {
+        cb_shifts = {
             "SLA":  "shl {r}, 1",
             "SRA":  "sar {r}, 1",
             "SRL":  "shr {r}, 1",
-            "RL":   "rcl {r}, 1",
-            "RR":   "rcr {r}, 1",
-            "RLC":  "rol {r}, 1",
-            "RRC":  "ror {r}, 1",
         }
-        for cb_name, template in cb_rotates.items():
+        for cb_name, template in cb_shifts.items():
             if m.startswith(f"{cb_name} "):
                 r = m.split()[1]
                 if r in REG8_TO_X86:
                     return [template.format(r=REG8_TO_X86[r])]
                 elif r == "(HL)":
                     return ["mov si, cx", template.format(r="byte [si]")]
+
+        # CB-prefixed circular rotates (RLC, RRC, RL, RR): update both CF and ZF!
+        cb_rotates = {
+            "RL":   "rcl",
+            "RR":   "rcr",
+            "RLC":  "rol",
+            "RRC":  "ror",
+        }
+        for cb_name, rot_op in cb_rotates.items():
+            if m.startswith(f"{cb_name} "):
+                r = m.split()[1]
+                if r in REG8_TO_X86:
+                    xr = REG8_TO_X86[r]
+                    return [f"{rot_op} {xr}, 1", "lahf", f"test {xr}, {xr}", "rcr ah, 1"]
+                elif r == "(HL)":
+                    return ["mov si, cx", f"{rot_op} byte [si], 1", "lahf", "cmp byte [si], 0", "rcr ah, 1"]
 
         # 7. Control Flow: JR / JP
         if m.startswith("JR "):
@@ -658,7 +687,7 @@ class CodeGenerator80186:
                 jcc = jcc_map.get(cond, "jmp")
                 return [f"{jcc} near {self.label_name(bank, target)}"]
 
-        # 8. CALL / RET / RST
+        # 8. CALL / RET / RST (use lea di, [di +/- 2] so CF/ZF flags are preserved!)
         if m.startswith("CALL "):
             parts = m[5:].split(", ")
             if len(parts) == 1:
@@ -666,7 +695,7 @@ class CodeGenerator80186:
                 self.labels.add((bank if target >= 0x4000 else 0, target))
                 ret_addr = f"0{next_addr:04X}h"
                 return [
-                    "sub di, 2",
+                    "lea di, [di - 2]",
                     f"mov word [di], {ret_addr}",
                     f"call near {self.label_name(bank, target)}"
                 ]
@@ -679,23 +708,23 @@ class CodeGenerator80186:
                 ret_addr = f"0{next_addr:04X}h"
                 return [
                     f"{neg_jcc} short {lbl_skip}",
-                    "sub di, 2",
+                    "lea di, [di - 2]",
                     f"mov word [di], {ret_addr}",
                     f"call near {self.label_name(bank, target)}",
                     f"{lbl_skip}:"
                 ]
 
         if m == "RET":
-            return ["add di, 2", "ret"]
+            return ["lea di, [di + 2]", "ret"]
         if m == "RETI":
-            return ["mov byte [cs:gb_ime], 1", "add di, 2", "ret"]
+            return ["mov byte [cs:gb_ime], 1", "lea di, [di + 2]", "ret"]
         if m.startswith("RET "):
             cond = m[4:]
             lbl_skip = f".skip_r_{addr:04x}"
             neg_jcc = {"Z": "jnz", "NZ": "jz", "C": "jnc", "NC": "jc"}.get(cond, "ret")
             return [
                 f"{neg_jcc} short {lbl_skip}",
-                "add di, 2",
+                "lea di, [di + 2]",
                 "ret",
                 f"{lbl_skip}:"
             ]
@@ -705,7 +734,7 @@ class CodeGenerator80186:
             self.labels.add((0, vec))
             ret_addr = f"0{next_addr:04X}h"
             return [
-                "sub di, 2",
+                "lea di, [di - 2]",
                 f"mov word [di], {ret_addr}",
                 f"call near {self.label_name(0, vec)}"
             ]
