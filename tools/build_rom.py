@@ -81,7 +81,71 @@ def read_inline_jump_table(disasm: SM83Disassembler, bank: int, table_addr: int)
     return targets
 
 
-def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int], hram_dma_addr: int):
+def load_sym_seeds(sym_path: str) -> Tuple[Set[int], Dict[int, Set[int]]]:
+    """
+    Parse an RGBDS / mgbdis .sym file for ROM code entry seeds.
+    Ignores mgbdis data/text/image/padding directives and non-ROM addresses (>= 0x8000).
+    """
+    b0_seeds: Set[int] = set()
+    bn_seeds: Dict[int, Set[int]] = {1: set(), 2: set(), 3: set()}
+    skip_prefixes = (".data:", ".text:", ".image:", ".padding:", ".data", ".text", ".image", ".padding")
+    with open(sym_path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.split(";", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            parts = line.split()
+            loc = parts[0]
+            name = parts[1] if len(parts) > 1 else ""
+            if any(name.lower().startswith(p) for p in skip_prefixes):
+                continue
+            try:
+                bank_str, addr_str = loc.split(":", 1)
+                bank = int(bank_str, 16)
+                addr = int(addr_str, 16)
+            except ValueError:
+                continue
+            if bank == 0 and 0x0000 <= addr < 0x4000:
+                b0_seeds.add(addr)
+            elif bank in (1, 2, 3) and 0x4000 <= addr < 0x8000:
+                bn_seeds[bank].add(addr)
+    return b0_seeds, bn_seeds
+
+
+def load_cdl_seeds(cdl_path: str, rom_size: int) -> Tuple[Set[int], Dict[int, Set[int]]]:
+    """
+    Parse a Mesen2 / Game Boy Code-Data-Log (.cdl) file.
+    Bit 0 (0x01) = executed code byte; Bit 4 (0x10) = jump/call target.
+    Seeds jump targets and starts of contiguous code runs in Banks 0..3.
+    """
+    b0_seeds: Set[int] = set()
+    bn_seeds: Dict[int, Set[int]] = {1: set(), 2: set(), 3: set()}
+    with open(cdl_path, "rb") as f:
+        cdl = f.read()
+    limit = min(len(cdl), rom_size, 0x10000)
+    prev_code = False
+    for offset in range(limit):
+        flags = cdl[offset]
+        is_code = bool(flags & 0x01)
+        is_target = bool(flags & 0x10)
+        if is_target or (is_code and not prev_code):
+            bank = offset // 0x4000
+            addr = (offset % 0x4000) + (0x4000 if bank > 0 else 0)
+            if bank == 0:
+                b0_seeds.add(addr)
+            elif bank in (1, 2, 3):
+                bn_seeds[bank].add(addr)
+        prev_code = is_code
+    return b0_seeds, bn_seeds
+
+
+def discover_control_flow(
+    disasm: SM83Disassembler,
+    rst_table_vecs: Set[int],
+    hram_dma_addr: int,
+    extra_b0_seeds: Set[int] = None,
+    extra_bn_seeds: Dict[int, Set[int]] = None,
+):
     """
     Perform validated control-flow and jump-table discovery across all banks.
     Never pollutes code labels with interior operand bytes or graphics/level data.
@@ -91,8 +155,10 @@ def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int], hr
     b0_to_bn_set: Set[int] = set()
     bn_to_b0_set: Set[int] = set()
 
-    # 1. Trace Bank 0 from hardware entry vectors
+    # 1. Trace Bank 0 from hardware entry vectors + optional .sym/.cdl seeds
     b0_seeds = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x100, 0x150, hram_dma_addr]
+    if extra_b0_seeds:
+        b0_seeds.extend(sorted(extra_b0_seeds))
     worklist: List[int] = list(b0_seeds)
     for a in b0_seeds:
         bank_labels[0].add(a)
@@ -235,7 +301,10 @@ def discover_control_flow(disasm: SM83Disassembler, rst_table_vecs: Set[int], hr
         for b in [1, 2, 3]:
             b_interior: Set[int] = set()
             pending_tables: Set[int] = set()
-            for t in sorted(b0_to_bn_set):
+            candidates = set(b0_to_bn_set)
+            if extra_bn_seeds and b in extra_bn_seeds:
+                candidates |= extra_bn_seeds[b]
+            for t in sorted(candidates):
                 bank_labels[b].add(t)
                 res = trace_bank_subgraph(b, t)
                 if res is not None:
@@ -294,6 +363,8 @@ def main():
     )
     parser.add_argument("rom", nargs="?", help="Path to input Game Boy (.gb) ROM file")
     parser.add_argument("-o", "--output", default="GAME.EXE", help="Output DOS executable name (default: GAME.EXE)")
+    parser.add_argument("--sym", help="Optional RGBDS/mgbdis .sym file for additional code entry seeds")
+    parser.add_argument("--cdl", help="Optional Mesen2/emulator .cdl Code-Data-Log file for code entry seeds")
     args = parser.parse_args()
 
     rom_path = args.rom
@@ -332,13 +403,36 @@ def main():
 
     disasm = SM83Disassembler(rom_bytes)
 
-    # 1. Detect inline RST jump-table dispatchers, HRAM DMA, & run control-flow discovery
+    # 1. Detect inline RST jump-table dispatchers, HRAM DMA, optional .sym/.cdl seeds, & run control-flow discovery
+    extra_b0_seeds: Set[int] = set()
+    extra_bn_seeds: Dict[int, Set[int]] = {1: set(), 2: set(), 3: set()}
+
+    rom_stem = os.path.splitext(rom_path)[0]
+    sym_path = args.sym or (rom_stem + ".sym" if os.path.exists(rom_stem + ".sym") else None)
+    cdl_path = args.cdl or (rom_stem + ".cdl" if os.path.exists(rom_stem + ".cdl") else None)
+
+    if sym_path and os.path.exists(sym_path):
+        s_b0, s_bn = load_sym_seeds(sym_path)
+        extra_b0_seeds |= s_b0
+        for bk in (1, 2, 3):
+            extra_bn_seeds[bk] |= s_bn[bk]
+        print(f"[gb200lx] Loaded .sym seeds from {sym_path}: B0={len(s_b0)}, B1..3={[len(s_bn[k]) for k in (1, 2, 3)]}")
+
+    if cdl_path and os.path.exists(cdl_path):
+        c_b0, c_bn = load_cdl_seeds(cdl_path, len(rom_bytes))
+        extra_b0_seeds |= c_b0
+        for bk in (1, 2, 3):
+            extra_bn_seeds[bk] |= c_bn[bk]
+        print(f"[gb200lx] Loaded .cdl seeds from {cdl_path}: B0={len(c_b0)}, B1..3={[len(c_bn[k]) for k in (1, 2, 3)]}")
+
     rst_table_vecs, pop_jp_hl_addrs = detect_rst_table_dispatchers(disasm)
     hram_dma_addr = detect_hram_dma_routine(disasm)
     print(f"[gb200lx] Detected inline jump-table RST vectors: {[hex(v) for v in sorted(rst_table_vecs)]}")
     print(f"[gb200lx] Detected HRAM OAM DMA source routine at: 0x{hram_dma_addr:04x}")
 
-    bank_labels, jp_hl_targets, b0_to_bn_set, bn_to_b0_set = discover_control_flow(disasm, rst_table_vecs, hram_dma_addr)
+    bank_labels, jp_hl_targets, b0_to_bn_set, bn_to_b0_set = discover_control_flow(
+        disasm, rst_table_vecs, hram_dma_addr, extra_b0_seeds, extra_bn_seeds
+    )
 
     b0_to_bn = sorted(list(b0_to_bn_set))
     b0_to_bn_idx = {t: i for i, t in enumerate(b0_to_bn)}
