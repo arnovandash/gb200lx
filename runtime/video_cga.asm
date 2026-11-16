@@ -687,6 +687,7 @@ cga_render_gb_frame:
 
     cld
 .tile_loop_unsigned:
+    xor     bh, bh
     mov     bl, cl
     inc     cl
     and     cl, 1Fh
@@ -703,6 +704,7 @@ cga_render_gb_frame:
     jmp     short .tiles_done
 
 .tile_loop_signed:
+    xor     bh, bh
     mov     bl, cl
     inc     cl
     and     cl, 1Fh
