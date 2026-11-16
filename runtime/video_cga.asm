@@ -554,9 +554,13 @@ cga_render_gb_frame:
     test    al, 80h             ; Bit 7: LCD enable
     jz      near .render_done   ; LCD disabled, skip
 
-    ; Ensure BGP nibble table is up to date with [ds:0FF47h]
+    ; Ensure BGP nibble table is up to date with [ds:0FF47h] (skip if unchanged)
     mov     al, [ds:0FF47h]
+    cmp     al, [cs:last_bgp]
+    je      .bgp_ok
+    mov     [cs:last_bgp], al
     call    helper_update_bgp
+.bgp_ok:
     mov     al, [ds:0FF40h]
 
     ; Setup ES = CS for rendering into offscreen backbuffer
@@ -631,73 +635,149 @@ cga_render_gb_frame:
     add     ax, [cs:render_map_base]
     mov     [cs:render_row_base], ax ; map row base pointer
 
-    ; Render 20 horizontal tiles across this scanline
-    xor     bp, bp              ; BP = tile column index (0..19)
-.tile_loop:
-    ; bg_x = (BP * 8 + SCX) & 0xFF
-    mov     ax, bp
-    shl     ax, 3               ; AX = BP * 8
-    add     al, [cs:render_scx] ; AL = bg_x
-    shr     al, 3               ; AL = tile_col (0..31)
-    xor     ah, ah
+    ; Fine horizontal scroll: fine_x = SCX & 7
+    mov     al, [cs:render_scx]
+    mov     ah, al
+    and     ah, 07h             ; AH = fine_x (0..7)
+    shr     al, 3               ; AL = starting tile_col (0..31)
+    mov     [cs:render_tile_col], al
 
-    ; Read tile index from map: [render_row_base + tile_col]
-    mov     si, [cs:render_row_base]
-    add     si, ax
-    mov     al, [ds:si]         ; AL = tile index (0..255)
+    ; If fine_x == 0: render 20 tiles directly to ES:DI (cga_backbuffer)
+    ; If fine_x != 0: render 21 tiles to cga_line_buf, then shift left by fine_x pixels into ES:DI
+    or      ah, ah
+    jz      .direct_line
+    mov     [cs:render_fine_x], ah
+    push    di                  ; Save backbuffer scanline ptr
+    mov     di, cga_line_buf
+    mov     byte [cs:render_tile_cnt], 21
+    jmp     short .start_tiles
+.direct_line:
+    mov     byte [cs:render_fine_x], 0
+    mov     byte [cs:render_tile_cnt], 20
 
-    ; Calculate tile data address: tile_idx * 16 + fine_y
-    cmp     byte [cs:render_unsigned_tile], 1
-    je      .unsigned_tile
-
-.signed_tile:
-    cbw                         ; Sign-extend AL to AX (-128..127)
-    shl     ax, 4               ; * 16
-    add     ax, 09000h          ; Signed base = 0x9000
-    jmp     short .tile_addr_done
-
-.unsigned_tile:
-    xor     ah, ah
-    shl     ax, 4               ; * 16
-    add     ax, 08000h          ; Unsigned base = 0x8000
-
-.tile_addr_done:
-    xor     bx, bx
+.start_tiles:
+    ; Precompute tile_data_base = (0x8000 or 0x9000) + fine_y in BP
     mov     bl, [cs:render_fine_y]
+    xor     bh, bh
+    cmp     byte [cs:render_unsigned_tile], 1
+    je      .base_unsigned
+    lea     bp, [bx + 09000h]
+    jmp     short .tile_loop_signed
+.base_unsigned:
+    lea     bp, [bx + 08000h]
+
+.tile_loop_unsigned:
+    xor     bh, bh
+    mov     bl, [cs:render_tile_col]
+    inc     byte [cs:render_tile_col]
+    and     byte [cs:render_tile_col], 1Fh
+    mov     si, [cs:render_row_base]
+    mov     al, [ds:si + bx]
+    xor     ah, ah
+    shl     ax, 4
+    add     ax, bp
     mov     si, ax
-    add     si, bx              ; SI = tile line address in GB RAM!
 
-    ; Read 2 bytes of planar tile data
-    mov     al, [ds:si]         ; Low bit plane (B0)
-    mov     ah, [ds:si+1]       ; High bit plane (B1)
+    mov     al, [ds:si]
+    mov     ah, [ds:si+1]
 
-    ; Convert 8 pixels to 2 bytes of CGA via dmg_cga_nibble_table
-    ; Left 4 pixels: (high nibble of B1 << 4) | (high nibble of B0)
     mov     bl, al
-    shr     bl, 4               ; low plane high nibble
+    shr     bl, 4
     mov     bh, ah
-    and     bh, 0F0h            ; high plane high nibble
+    and     bh, 0F0h
     or      bl, bh
     xor     bh, bh
     mov     dl, [cs:dmg_cga_nibble_table + bx]
 
-    ; Right 4 pixels: (low nibble of B1 << 4) | (low nibble of B0)
     mov     bl, al
-    and     bl, 0Fh             ; low plane low nibble
+    and     bl, 0Fh
     mov     bh, ah
-    shl     bh, 4               ; high plane low nibble
+    shl     bh, 4
     or      bl, bh
     xor     bh, bh
     mov     dh, [cs:dmg_cga_nibble_table + bx]
 
-    ; Write 2 bytes (1 word) to CGA VRAM
     mov     [es:di], dx
     add     di, 2
 
-    inc     bp
-    cmp     bp, 20
-    jb      .tile_loop
+    dec     byte [cs:render_tile_cnt]
+    jnz     .tile_loop_unsigned
+    jmp     short .tiles_done
 
+.tile_loop_signed:
+    xor     bh, bh
+    mov     bl, [cs:render_tile_col]
+    inc     byte [cs:render_tile_col]
+    and     byte [cs:render_tile_col], 1Fh
+    mov     si, [cs:render_row_base]
+    mov     al, [ds:si + bx]
+    cbw
+    shl     ax, 4
+    add     ax, bp
+    mov     si, ax
+
+    mov     al, [ds:si]
+    mov     ah, [ds:si+1]
+
+    mov     bl, al
+    shr     bl, 4
+    mov     bh, ah
+    and     bh, 0F0h
+    or      bl, bh
+    xor     bh, bh
+    mov     dl, [cs:dmg_cga_nibble_table + bx]
+
+    mov     bl, al
+    and     bl, 0Fh
+    mov     bh, ah
+    shl     bh, 4
+    or      bl, bh
+    xor     bh, bh
+    mov     dh, [cs:dmg_cga_nibble_table + bx]
+
+    mov     [es:di], dx
+    add     di, 2
+
+    dec     byte [cs:render_tile_cnt]
+    jnz     .tile_loop_signed
+
+.tiles_done:
+    mov     cl, [cs:render_fine_x]
+    or      cl, cl
+    jz      .line_done
+
+    ; Shift 42-byte cga_line_buf left by fine_x (1..7) pixels into saved backbuffer DI
+    pop     di                  ; ES:DI = cga_backbuffer scanline
+    mov     si, cga_line_buf
+    cmp     cl, 4
+    jb      .fine_shift
+    inc     si                  ; fine_x >= 4 skips 1 full byte (4 pixels)
+    sub     cl, 4
+    jnz     .fine_shift
+    ; fine_x == 4: byte-aligned copy of 20 words!
+    push    ds
+    mov     ax, cs
+    mov     ds, ax
+    mov     cx, (GB_BYTES_PER_LINE / 2)
+    cld
+    rep     movsw
+    pop     ds
+    jmp     short .line_done
+
+.fine_shift:
+    shl     cl, 1               ; CL = 2, 4, or 6 bits
+    mov     bx, GB_BYTES_PER_LINE
+.shift_byte_loop:
+    mov     ah, [cs:si]
+    mov     al, [cs:si+1]
+    shl     ax, cl
+    mov     [es:di], ah
+    inc     si
+    inc     di
+    dec     bx
+    jnz     .shift_byte_loop
+
+.line_done:
     pop     cx
     inc     cx
     cmp     cx, GB_SCREEN_HEIGHT
@@ -1050,3 +1130,8 @@ render_spr_tile:        db 0
 render_spr_attr:        db 0
 render_spr_pal:         db 0
 render_win_scol:        db 0
+last_bgp:               db 0FFh
+render_tile_col:        db 0
+render_fine_x:          db 0
+render_tile_cnt:        db 20
+cga_line_buf:           times 44 db 0

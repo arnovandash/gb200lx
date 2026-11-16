@@ -412,16 +412,6 @@ helper_halt:
     cmp     byte [cs:exit_requested], 1
     je      .do_exit
 
-    ; Wait briefly for vertical retrace (with short timeout so headless/fast runs don't stall)
-    mov     dx, 03DAh
-    mov     cx, 4000
-.wait_vr:
-    in      al, dx
-    test    al, 08h
-    jnz     .vr_ok
-    loop    .wait_vr
-.vr_ok:
-
     ; Render CGA frame (needs DS = gb_mem_seg)
     mov     ax, [cs:gb_mem_seg]
     mov     ds, ax
@@ -436,7 +426,7 @@ helper_halt:
     jmp     game_clean_exit
 
 .check_keys:
-    ; Check BIOS keyboard buffer if any unmapped key or ESC arrived
+    ; Drain BIOS keyboard buffer if any unmapped key or ESC arrived
     mov     ah, 01h
     int     16h
     jz      .check_vblank
@@ -444,6 +434,7 @@ helper_halt:
     int     16h
     cmp     al, 1Bh                     ; ESC key
     je      game_clean_exit
+    jmp     short .check_keys
 
 .check_vblank:
     mov     ax, [cs:gb_mem_seg]

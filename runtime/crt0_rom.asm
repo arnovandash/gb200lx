@@ -270,9 +270,10 @@ int09_handler:
     push    ds
     mov     ax, cs
     mov     ds, ax
-    mov     es, ax
 
     in      al, 60h                     ; Read keyboard controller scancode
+    cmp     al, 0E0h                    ; Ignore extended scancode prefix cleanly
+    je      .key_ack
 
     ; Check ESC / cfg_key_menu
     cmp     al, [cfg_key_menu]
