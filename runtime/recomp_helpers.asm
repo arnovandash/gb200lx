@@ -74,6 +74,25 @@ helper_pop_af:
 ; helper_write_hl: Range check for indirect write to [si]
 ; SI = target address, AL = byte to write. Preserves all CPU flags!
 ; ------------------------------------------------------------------------------
+%macro MARK_TILE_DIRTY 1
+    cmp     %1, 09800h
+    jae     short %%not_tile
+%ifdef SEG_IS_BANK0
+    push    bx
+    mov     bx, %1
+    sub     bx, 08000h
+    shr     bx, 4
+    mov     byte [cs:tile_dirty + bx], 1
+    pop     bx
+%else
+    push    bp
+    mov     bp, %1
+    call    helper_mark_tile_dirty
+    pop     bp
+%endif
+%%not_tile:
+%endmacro
+
 global helper_write_hl
 helper_write_hl:
     pushf
@@ -82,6 +101,7 @@ helper_write_hl:
     cmp     si, 0FE00h
     jae     short .hl_mmio
     mov     [si], al
+    MARK_TILE_DIRTY si
     popf
     ret
 .hl_mbc:
@@ -108,6 +128,7 @@ helper_write_bc:
     cmp     bx, 0FE00h
     jae     short .bc_mmio
     mov     [bx], al
+    MARK_TILE_DIRTY bx
     popf
     ret
 .bc_mbc:
@@ -135,6 +156,7 @@ helper_write_de:
     jae     short .de_mmio
     mov     bp, dx
     mov     [ds:bp], al
+    MARK_TILE_DIRTY dx
     popf
     ret
 .de_mbc:
@@ -502,6 +524,16 @@ helper_halt:
     popf
     ret
 
+global helper_mark_tile_dirty
+helper_mark_tile_dirty:
+    push    bx
+    mov     bx, bp
+    sub     bx, 08000h
+    shr     bx, 4
+    mov     byte [cs:tile_dirty + bx], 1
+    pop     bx
+    ret
+
 %else
 ; ==============================================================================
 ; SEGMENTS 1..3 (BANKS 1..3) FAR-CALL BRIDGES TO SEGMENT 0
@@ -613,6 +645,21 @@ helper_halt:
     sub     bx, SEG_PARAS_VAL
     push    bx
     push    word 001Ch
+    mov     bx, sp
+    call    far [ss:bx]
+    add     sp, 4
+    pop     bx
+    popf
+    ret
+
+global helper_mark_tile_dirty
+helper_mark_tile_dirty:
+    pushf
+    push    bx
+    mov     bx, cs
+    sub     bx, SEG_PARAS_VAL
+    push    bx
+    push    word 0020h
     mov     bx, sp
     call    far [ss:bx]
     add     sp, 4

@@ -28,9 +28,10 @@ def pack_mz(input_bin: str, output_exe: str, min_extra: int = 0x1000, max_extra:
     # Paragraph layout:
     # 0 .. image_paras: Code and ROM image
     # image_paras .. image_paras + 0x1000: Game Boy 64 KiB RAM block
-    # image_paras + 0x1000 .. image_paras + 0x1800: Hardware Stack (32 KiB)
+    # image_paras + 0x1000 .. image_paras + 0x1200: 8 KiB CGA backbuffer segment
+    # image_paras + 0x1200 .. image_paras + 0x1A00: Hardware Stack (32 KiB)
     image_paras = len(image) // 16
-    gb_ram_paras = 0x1000 # 64 KiB
+    gb_ram_paras = 0x1200 # 64 KiB GB RAM + 8 KiB CGA backbuffer
     stack_paras = 0x0800  # 32 KiB
     actual_min_extra = max(min_extra, gb_ram_paras + stack_paras)
 

@@ -565,11 +565,23 @@ cga_render_gb_frame:
     mov     al, [cs:cfg_shade0 + bx]
     and     al, 03h
     mov     [cs:render_bg0_shade], al
+    ; Mark all 384 VRAM tiles dirty on palette change
+    push    di
+    mov     ax, cs
+    mov     es, ax
+    mov     di, tile_dirty
+    mov     ax, 0101h
+    mov     cx, 192
+    cld
+    rep     stosw
+    pop     di
 .bgp_ok:
+    ; Decode any dirty tiles in 0x8000..0x97FF into cga_tile_cache
+    call    update_cga_tile_cache
     mov     al, [ds:0FF40h]
 
-    ; Setup ES = CS for rendering into offscreen backbuffer
-    mov     bx, cs
+    ; Setup ES = backbuffer_seg for rendering into offscreen backbuffer
+    mov     bx, [cs:backbuffer_seg]
     mov     es, bx
 
     ; Determine BG tile map base: bit 3 of LCDC
@@ -647,12 +659,14 @@ cga_render_gb_frame:
     shr     al, 3               ; AL = starting tile_col (0..31)
     mov     cl, al              ; CL = tile_col (0..31)
 
-    ; If fine_x == 0: render 20 tiles directly to ES:DI (cga_backbuffer)
-    ; If fine_x != 0: render 21 tiles to cga_line_buf, then shift left by fine_x pixels into ES:DI
+    ; If fine_x == 0: render 20 tiles directly to ES:DI (backbuffer_seg)
+    ; If fine_x != 0: render 21 tiles to CS:cga_line_buf, then shift left by fine_x pixels into backbuffer_seg:DI
     or      ah, ah
     jz      .direct_line
     mov     [cs:render_fine_x], ah
     push    di                  ; Save backbuffer scanline ptr
+    mov     bx, cs
+    mov     es, bx
     mov     di, cga_line_buf
     mov     ch, 21              ; CH = tile count
     jmp     short .start_tiles
@@ -661,16 +675,17 @@ cga_render_gb_frame:
     mov     ch, 20              ; CH = tile count
 
 .start_tiles:
-    ; Precompute tile_data_base = (0x8000 or 0x9000) + fine_y in BP
+    ; Precompute tile_cache_base = cga_tile_cache (+ 1000h for signed) + fine_y in BP
     mov     bl, [cs:render_fine_y]
     xor     bh, bh
     cmp     byte [cs:render_unsigned_tile], 1
     je      .base_unsigned
-    lea     bp, [bx + 09000h]
+    lea     bp, [bx + cga_tile_cache + 1000h]
     jmp     short .tile_loop_signed
 .base_unsigned:
-    lea     bp, [bx + 08000h]
+    lea     bp, [bx + cga_tile_cache]
 
+    cld
 .tile_loop_unsigned:
     mov     bl, cl
     inc     cl
@@ -680,30 +695,9 @@ cga_render_gb_frame:
     xor     ah, ah
     shl     ax, 4
     add     ax, bp
-    mov     si, ax
-
-    mov     al, [ds:si]
-    mov     ah, [ds:si+1]
-
-    mov     bl, al
-    shr     bl, 4
-    mov     bh, ah
-    and     bh, 0F0h
-    or      bl, bh
-    xor     bh, bh
-    mov     dl, [cs:dmg_cga_nibble_table + bx]
-
-    mov     bl, al
-    and     bl, 0Fh
-    mov     bh, ah
-    shl     bh, 4
-    or      bl, bh
-    xor     bh, bh
-    mov     dh, [cs:dmg_cga_nibble_table + bx]
-
-    mov     [es:di], dx
-    add     di, 2
-
+    mov     bx, ax
+    mov     ax, [cs:bx]
+    stosw
     dec     ch
     jnz     .tile_loop_unsigned
     jmp     short .tiles_done
@@ -717,30 +711,9 @@ cga_render_gb_frame:
     cbw
     shl     ax, 4
     add     ax, bp
-    mov     si, ax
-
-    mov     al, [ds:si]
-    mov     ah, [ds:si+1]
-
-    mov     bl, al
-    shr     bl, 4
-    mov     bh, ah
-    and     bh, 0F0h
-    or      bl, bh
-    xor     bh, bh
-    mov     dl, [cs:dmg_cga_nibble_table + bx]
-
-    mov     bl, al
-    and     bl, 0Fh
-    mov     bh, ah
-    shl     bh, 4
-    or      bl, bh
-    xor     bh, bh
-    mov     dh, [cs:dmg_cga_nibble_table + bx]
-
-    mov     [es:di], dx
-    add     di, 2
-
+    mov     bx, ax
+    mov     ax, [cs:bx]
+    stosw
     dec     ch
     jnz     .tile_loop_signed
 
@@ -749,8 +722,10 @@ cga_render_gb_frame:
     or      cl, cl
     jz      .line_done
 
-    ; Shift 42-byte cga_line_buf left by fine_x (1..7) pixels into saved backbuffer DI
-    pop     di                  ; ES:DI = cga_backbuffer scanline
+    ; Shift 42-byte cga_line_buf left by fine_x (1..7) pixels into backbuffer_seg:DI
+    pop     di
+    mov     ax, [cs:backbuffer_seg]
+    mov     es, ax
     mov     si, cga_line_buf
     cmp     cl, 4
     jb      .fine_shift
@@ -1083,14 +1058,14 @@ cga_render_gb_frame:
     jnz     near .spr_loop
 
 .blit_backbuffer:
-    ; Blit completed 160x144 composited frame from cga_backbuffer to CGA VRAM (0xB800)
+    ; Blit completed 160x144 composited frame from backbuffer_seg to CGA VRAM (0xB800)
     push    ds
     mov     ax, CGA_VRAM_SEG
     mov     es, ax
-    mov     ax, cs
+    mov     ax, [cs:backbuffer_seg]
     mov     ds, ax
 
-    mov     si, cga_backbuffer
+    xor     si, si
     xor     bx, bx              ; BX = scanline index (0..143) * 2
     cld
 .blit_line_loop:
@@ -1115,14 +1090,78 @@ cga_render_gb_frame:
     popf
     ret
 
+; ------------------------------------------------------------------------------
+; update_cga_tile_cache: Decode any dirty tiles (0..383) from DS:8000h..97FFh
+; into CS:cga_tile_cache (16 bytes per tile, 8 rows * 2 CGA bytes).
+; Preserves DS; clobbers AX, BX, CX, DX, SI, DI, ES.
+; ------------------------------------------------------------------------------
+update_cga_tile_cache:
+    mov     ax, cs
+    mov     es, ax
+    mov     di, tile_dirty
+    xor     al, al
+    mov     cx, 384
+    cld
+.scan_dirty:
+    repe    scasb
+    jz      .cache_done
+    ; Found dirty tile at index = (DI - 1) - tile_dirty
+    mov     bx, di
+    dec     bx
+    mov     byte [cs:bx], 0
+    sub     bx, tile_dirty
+    shl     bx, 4               ; BX = byte offset (0..6128)
+    push    cx
+    push    di
+
+    lea     si, [bx + 08000h]   ; DS:SI = GB VRAM tile
+    lea     di, [bx + cga_tile_cache] ; ES:DI = CS tile cache slot
+    mov     cx, 8               ; 8 rows per tile
+.row_loop:
+    mov     al, [ds:si]
+    mov     ah, [ds:si+1]
+    add     si, 2
+
+    mov     bl, al
+    shr     bl, 4
+    mov     bh, ah
+    and     bh, 0F0h
+    or      bl, bh
+    xor     bh, bh
+    mov     dl, [cs:dmg_cga_nibble_table + bx]
+
+    mov     bl, al
+    and     bl, 0Fh
+    mov     bh, ah
+    shl     bh, 4
+    or      bl, bh
+    xor     bh, bh
+    mov     dh, [cs:dmg_cga_nibble_table + bx]
+
+    mov     [es:di], dx
+    add     di, 2
+    loop    .row_loop
+
+    pop     di
+    pop     cx
+    or      cx, cx
+    jnz     .scan_dirty
+.cache_done:
+    ret
+
     align 16
-cga_backbuffer:
-    times (GB_BYTES_PER_LINE * GB_SCREEN_HEIGHT) db 0
+global tile_dirty
+tile_dirty:
+    times 384 db 1
+
+    align 16
+cga_tile_cache:
+    times (384 * 16) db 0
 
 backbuffer_scanline_offsets:
 %assign y 0
 %rep GB_SCREEN_HEIGHT
-    dw cga_backbuffer + (y * GB_BYTES_PER_LINE)
+    dw (y * GB_BYTES_PER_LINE)
 %assign y y+1
 %endrep
 

@@ -83,6 +83,8 @@ entry:
     mov     ax, [seg_rom_data]
     add     ax, 1000h               ; ax = paragraph base of 64 KiB Game Boy memory block
     mov     [gb_mem_seg], ax        ; Save 64 KiB Game Boy memory segment
+    add     ax, 1000h               ; ax = paragraph base of 8 KiB CGA backbuffer segment
+    mov     [backbuffer_seg], ax
 
     ; 4. Zero-initialize the 64 KiB Game Boy memory block
     mov     es, ax
@@ -445,8 +447,9 @@ print_dos_string:
 ; Variables & Constants
 ; ------------------------------------------------------------------------------
 fn_vram_dump:       db  "CGA_VRAM.BIN", 0
-global gb_mem_seg
+global gb_mem_seg, backbuffer_seg
 gb_mem_seg:         dw  0
+backbuffer_seg:     dw  0
 
 exit_requested:     db  0
 global auto_exit_frames

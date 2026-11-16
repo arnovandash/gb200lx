@@ -468,8 +468,10 @@ def main():
         "    retf",
         "    call near helper_halt",
         "    retf",
+        "    call near helper_mark_tile_dirty",
+        "    retf",
         "",
-        "; Table of wrappers in Bank 0 called from Banks 1..3 (starts at exact offset 0020h = 32)",
+        "; Table of wrappers in Bank 0 called from Banks 1..3 (starts at exact offset 0024h = 36)",
         "global b0_entry_table",
         "b0_entry_table:",
     ]
@@ -557,7 +559,7 @@ def main():
                 disp_bn_lines.append(f"    call near call_bank0_{t:04x}")
                 disp_bn_lines.append("    ret")
 
-        disp_bn_lines.append("\n; Far call helpers for calling Bank 0 (b0_entry_table starts at offset 32)")
+        disp_bn_lines.append("\n; Far call helpers for calling Bank 0 (b0_entry_table starts at offset 36)")
         for t in bn_to_b0:
             idx = bn_to_b0_idx[t]
             disp_bn_lines.append(f"global call_bank0_{t:04x}")
@@ -566,7 +568,7 @@ def main():
             disp_bn_lines.append("    mov bp, cs")
             disp_bn_lines.append("    sub bp, SEG_PARAS_VAL")
             disp_bn_lines.append("    push bp")
-            disp_bn_lines.append(f"    push word (32 + {idx * 4})")
+            disp_bn_lines.append(f"    push word (36 + {idx * 4})")
             disp_bn_lines.append("    mov bp, sp")
             disp_bn_lines.append("    call far [bp]")
             disp_bn_lines.append("    pop bp")
