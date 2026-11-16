@@ -601,176 +601,262 @@ cga_render_gb_frame:
     mov     byte [cs:render_unsigned_tile], 1
 .tile_mode_ok:
 
-    ; Read SCY and SCX
+    ; Read initial SCY/SCX (updated per strip for LYC split)
     mov     al, [ds:0FF42h]
     mov     [cs:render_scy], al
     mov     al, [ds:0FF43h]
     mov     [cs:render_scx], al
 
-    ; Render 144 scanlines (Y = 0..143)
-    xor     cx, cx              ; CX = screen line Y (0..143)
-.line_loop:
-    push    cx
-
-    ; Check if STAT LYC split-scroll applies to this scanline (Y <= LYC)
-    mov     al, [ds:0FF42h]
-    mov     ah, [ds:0FF43h]
+    ; Precompute STAT LYC split limit: split applies for Y < split_limit (0 = disabled)
+    mov     byte [cs:render_split_limit], 0
     test    byte [ds:0FFFFh], 02h
-    jz      .use_main_scroll
-    mov     bl, [ds:0FF45h]
-    cmp     bl, 0
-    je      .use_main_scroll
-    cmp     bl, 144
-    jae     .use_main_scroll
-    cmp     cl, bl
-    ja      .use_main_scroll
+    jz      .split_done
+    mov     al, [ds:0FF45h]
+    cmp     al, 0
+    je      .split_done
+    cmp     al, GB_SCREEN_HEIGHT
+    jae     .split_done
+    inc     al
+    mov     [cs:render_split_limit], al
+.split_done:
+
+    ; Render 144 BG scanlines in tile-row strips (up to 8 scanlines per strip)
+    xor     cx, cx              ; CX = screen Y (0..143)
+.bg_strip_loop:
+    mov     [cs:render_y], cx
+    cmp     cl, [cs:render_split_limit]
+    jb      .use_hud_scroll
+    mov     al, [ds:0FF42h]     ; Main SCY
+    mov     ah, [ds:0FF43h]     ; Main SCX
+    mov     dl, GB_SCREEN_HEIGHT
+    jmp     short .scroll_ready
+.use_hud_scroll:
     mov     al, [cs:hud_scy]
     mov     ah, [cs:hud_scx]
-.use_main_scroll:
+    mov     dl, [cs:render_split_limit]
+.scroll_ready:
     mov     [cs:render_scy], al
     mov     [cs:render_scx], ah
 
-    ; Calculate backbuffer destination pointer for line Y
+    ; bg_y = (Y + SCY) & 0xFF
+    mov     bl, cl
+    add     bl, al              ; BL = bg_y
+    mov     bh, bl
+    and     bh, 07h             ; BH = fine_y (0..7)
+
+    ; run_lines = min(8 - fine_y, region_end - Y)  (1..8)
+    mov     dh, 8
+    sub     dh, bh
+    sub     dl, cl              ; region_end - Y (>= 1)
+    cmp     dh, dl
+    jbe     .bg_rl_ok
+    mov     dh, dl
+.bg_rl_ok:
+    mov     [cs:render_run_lines], dh
+
+    ; BP = cga_tile_cache (+ 1000h if signed) + fine_y * 2
+    shl     bh, 1
+    mov     al, bh
+    xor     ah, ah
+    cmp     byte [cs:render_unsigned_tile], 1
+    je      .bg_bp_unsigned
+    add     ax, cga_tile_cache + 1000h
+    jmp     short .bg_bp_ok
+.bg_bp_unsigned:
+    add     ax, cga_tile_cache
+.bg_bp_ok:
+    mov     bp, ax
+
+    ; SI = map row base = render_map_base + ((bg_y >> 3) * 32)
+    shr     bl, 3
+    mov     al, bl
+    xor     ah, ah
+    shl     ax, 5
+    add     ax, [cs:render_map_base]
+    mov     si, ax
+
+    ; DI = backbuffer destination for scanline Y
     mov     bx, cx
     shl     bx, 1
-    mov     di, [cs:backbuffer_scanline_offsets + bx] ; ES:DI = backbuffer scanline destination
+    mov     di, [cs:backbuffer_scanline_offsets + bx]
 
-    ; bg_y = (Y + SCY) & 0xFF
-    mov     al, cl
-    add     al, [cs:render_scy] ; AL = bg_y
-
-    ; tile_row = bg_y >> 3 (0..31)
-    ; fine_y = (bg_y & 7) * 2
-    mov     ah, al
-    and     ah, 07h
-    shl     ah, 1               ; AH = fine_y * 2
-    mov     [cs:render_fine_y], ah
-
-    shr     al, 3               ; AL = tile_row (0..31)
-    xor     ah, ah
-    shl     ax, 5               ; AX = tile_row * 32 (offset within 32x32 map)
-    add     ax, [cs:render_map_base]
-    mov     [cs:render_row_base], ax ; map row base pointer
-
-    ; Fine horizontal scroll: fine_x = SCX & 7
+    ; Check horizontal fine scroll (SCX & 7)
     mov     al, [cs:render_scx]
     mov     ah, al
     and     ah, 07h             ; AH = fine_x (0..7)
     shr     al, 3               ; AL = starting tile_col (0..31)
-    mov     cl, al              ; CL = tile_col (0..31)
-
-    ; If fine_x == 0: render 20 tiles directly to ES:DI (backbuffer_seg)
-    ; If fine_x != 0: render 21 tiles to CS:cga_line_buf, then shift left by fine_x pixels into backbuffer_seg:DI
     or      ah, ah
-    jz      .direct_line
+    jnz     .bg_fine_scroll
+
+    ; Aligned strip (fine_x == 0): render 20 tiles directly to backbuffer_seg
+    mov     cl, al
+    mov     ch, 20
+    call    render_aligned_strip
+    jmp     near .bg_strip_next
+
+.bg_fine_scroll:
+    ; Fine-scrolled strip: render 21 tiles x run_lines into CS:cga_strip_buf (stride 44)
     mov     [cs:render_fine_x], ah
-    push    di                  ; Save backbuffer scanline ptr
+    mov     [cs:render_dest_di], di
+    push    es
     mov     bx, cs
     mov     es, bx
-    mov     di, cga_line_buf
-    mov     ch, 21              ; CH = tile count
-    jmp     short .start_tiles
-.direct_line:
-    mov     byte [cs:render_fine_x], 0
-    mov     ch, 20              ; CH = tile count
-
-.start_tiles:
-    ; Precompute tile_cache_base = cga_tile_cache (+ 1000h for signed) + fine_y in BP
-    mov     bl, [cs:render_fine_y]
+    mov     di, cga_strip_buf
+    mov     cl, al
+    mov     ch, 21
     xor     bh, bh
+    mov     bl, [cs:render_run_lines]
+    dec     bx
+    shl     bx, 1
     cmp     byte [cs:render_unsigned_tile], 1
-    je      .base_unsigned
-    lea     bp, [bx + cga_tile_cache + 1000h]
-    jmp     short .tile_loop_signed
-.base_unsigned:
-    lea     bp, [bx + cga_tile_cache]
-
-    cld
-.tile_loop_unsigned:
+    je      .sc_go_u
+    mov     dx, [cs:sc_s_tab + bx]
+.sc_loop_s:
     xor     bh, bh
     mov     bl, cl
     inc     cl
     and     cl, 1Fh
-    mov     si, [cs:render_row_base]
-    mov     al, [ds:si + bx]
-    xor     ah, ah
-    shl     ax, 4
-    add     ax, bp
-    mov     bx, ax
-    mov     ax, [cs:bx]
-    stosw
-    dec     ch
-    jnz     .tile_loop_unsigned
-    jmp     short .tiles_done
-
-.tile_loop_signed:
-    xor     bh, bh
-    mov     bl, cl
-    inc     cl
-    and     cl, 1Fh
-    mov     si, [cs:render_row_base]
     mov     al, [ds:si + bx]
     cbw
     shl     ax, 4
     add     ax, bp
     mov     bx, ax
-    mov     ax, [cs:bx]
-    stosw
+    jmp     dx
+.sc_s_8: mov ax, [cs:bx+14]
+         mov [es:di+308], ax
+.sc_s_7: mov ax, [cs:bx+12]
+         mov [es:di+264], ax
+.sc_s_6: mov ax, [cs:bx+10]
+         mov [es:di+220], ax
+.sc_s_5: mov ax, [cs:bx+8]
+         mov [es:di+176], ax
+.sc_s_4: mov ax, [cs:bx+6]
+         mov [es:di+132], ax
+.sc_s_3: mov ax, [cs:bx+4]
+         mov [es:di+88], ax
+.sc_s_2: mov ax, [cs:bx+2]
+         mov [es:di+44], ax
+.sc_s_1: mov ax, [cs:bx]
+         mov [es:di], ax
+    add     di, 2
     dec     ch
-    jnz     .tile_loop_signed
+    jnz     .sc_loop_s
+    jmp     short .sc_filled
 
-.tiles_done:
-    mov     cl, [cs:render_fine_x]
-    or      cl, cl
-    jz      .line_done
+.sc_go_u:
+    mov     dx, [cs:sc_u_tab + bx]
+.sc_loop_u:
+    xor     bh, bh
+    mov     bl, cl
+    inc     cl
+    and     cl, 1Fh
+    mov     al, [ds:si + bx]
+    xor     ah, ah
+    shl     ax, 4
+    add     ax, bp
+    mov     bx, ax
+    jmp     dx
+.sc_u_8: mov ax, [cs:bx+14]
+         mov [es:di+308], ax
+.sc_u_7: mov ax, [cs:bx+12]
+         mov [es:di+264], ax
+.sc_u_6: mov ax, [cs:bx+10]
+         mov [es:di+220], ax
+.sc_u_5: mov ax, [cs:bx+8]
+         mov [es:di+176], ax
+.sc_u_4: mov ax, [cs:bx+6]
+         mov [es:di+132], ax
+.sc_u_3: mov ax, [cs:bx+4]
+         mov [es:di+88], ax
+.sc_u_2: mov ax, [cs:bx+2]
+         mov [es:di+44], ax
+.sc_u_1: mov ax, [cs:bx]
+         mov [es:di], ax
+    add     di, 2
+    dec     ch
+    jnz     .sc_loop_u
 
-    ; Shift 42-byte cga_line_buf left by fine_x (1..7) pixels into backbuffer_seg:DI
-    pop     di
-    mov     ax, [cs:backbuffer_seg]
-    mov     es, ax
-    mov     si, cga_line_buf
+.sc_filled:
+    ; Blit/shift run_lines scanlines from CS:cga_strip_buf to backbuffer_seg:render_dest_di
+    pop     es                  ; ES = backbuffer_seg
+    push    ds                  ; Save gb_mem_seg
+    mov     ax, cs
+    mov     ds, ax              ; DS = CS for fast lodsb/lodsw
+    mov     si, cga_strip_buf
+    mov     di, [render_dest_di]
+    mov     cl, [render_fine_x]
     cmp     cl, 4
-    jb      .fine_shift
+    jb      .sb_shift_setup
     inc     si                  ; fine_x >= 4 skips 1 full byte (4 pixels)
     sub     cl, 4
-    jnz     .fine_shift
-    ; fine_x == 4: byte-aligned copy of 20 words!
-    push    ds
-    mov     ax, cs
-    mov     ds, ax
+    jnz     .sb_shift_setup
+
+    ; fine_x == 4: byte-aligned 20-word rep movsw per scanline!
+    mov     bl, [render_run_lines]
+    cld
+.sb4_loop:
+    push    si
+    push    di
     mov     cx, (GB_BYTES_PER_LINE / 2)
-    cld
     rep     movsw
-    pop     ds
-    jmp     short .line_done
+    pop     di
+    pop     si
+    add     si, 44
+    add     di, GB_BYTES_PER_LINE
+    dec     bl
+    jnz     .sb4_loop
+    jmp     short .sb_done
 
-.fine_shift:
-    shl     cl, 1               ; CL = 2, 4, or 6 bits
-    mov     bx, (GB_BYTES_PER_LINE / 2) ; 20 words = 40 bytes
+.sb_shift_setup:
+    shl     cl, 1               ; CL = 2, 4, or 6 bits left shift
+    mov     ch, 8
+    sub     ch, cl              ; CH = 6, 4, or 2 bits right shift
+    mov     al, [render_run_lines]
+    mov     [render_row_cnt], al
     cld
-.shift_word_loop:
-    mov     ah, [cs:si]
-    mov     al, [cs:si+1]
-    shl     ax, cl
-    mov     dl, ah
-    mov     ah, [cs:si+1]
-    mov     al, [cs:si+2]
-    shl     ax, cl
-    mov     dh, ah
-    mov     ax, dx
+.sb_line_loop:
+    push    si
+    push    di
+    lodsb
+    mov     bh, al              ; BH = b0
+    mov     bp, (GB_BYTES_PER_LINE / 2)
+.sb_word_loop:
+    lodsw                       ; AL = b1, AH = b2
+    mov     bl, ah              ; BL = b2 (next iter's b0)
+    mov     ah, bh              ; AH = b0, AL = b1
+    shl     ax, cl              ; AH = out0, AL = b1 << CL
+    mov     dl, ah              ; DL = out0
+    mov     ah, bl              ; AH = b2
+    xchg    cl, ch
+    shr     ah, cl              ; AH = b2 >> (8 - CL)
+    xchg    cl, ch
+    or      al, ah              ; AL = out1
+    mov     ah, al
+    mov     al, dl              ; AX = (out1 << 8) | out0
     stosw
-    add     si, 2
-    dec     bx
-    jnz     .shift_word_loop
+    mov     bh, bl
+    dec     bp
+    jnz     .sb_word_loop
+    pop     di
+    pop     si
+    add     si, 44
+    add     di, GB_BYTES_PER_LINE
+    dec     byte [render_row_cnt]
+    jnz     .sb_line_loop
 
-.line_done:
-    pop     cx
-    inc     cx
+.sb_done:
+    pop     ds                  ; Restore DS = gb_mem_seg
+
+.bg_strip_next:
+    mov     cx, [cs:render_y]
+    xor     ah, ah
+    mov     al, [cs:render_run_lines]
+    add     cx, ax
     cmp     cx, GB_SCREEN_HEIGHT
-    jb      near .line_loop
+    jb      near .bg_strip_loop
 
     ; --------------------------------------------------------------------------
-    ; Render Game Boy Window Layer (if LCDC bit 5 is enabled)
+    ; Render Game Boy Window Layer (if LCDC bit 5 is enabled) using cga_tile_cache
     ; --------------------------------------------------------------------------
     mov     al, [ds:0FF40h]
     test    al, 20h             ; Bit 5: Window enable
@@ -798,89 +884,53 @@ cga_render_gb_frame:
     shr     al, 3
     mov     [cs:render_win_scol], al
 
-.win_line_loop:
-    push    cx
+    ; BP = cga_tile_cache (+ 1000h if signed), fine_y is always 0 for window strips
+    mov     bp, cga_tile_cache
+    cmp     byte [cs:render_unsigned_tile], 1
+    je      .win_strip_loop
+    add     bp, 1000h
 
+.win_strip_loop:
+    mov     [cs:render_y], cx
+    mov     ax, GB_SCREEN_HEIGHT
+    sub     ax, cx
+    cmp     ax, 8
+    jbe     .win_rl_ok
+    mov     al, 8
+.win_rl_ok:
+    mov     [cs:render_run_lines], al
+
+    ; win_row_base = win_map_base + ((Y - WY) >> 3) * 32
+    mov     al, cl
+    sub     al, [ds:0FF4Ah]
+    shr     al, 3
+    xor     ah, ah
+    shl     ax, 5
+    add     ax, [cs:render_map_base]
+    mov     si, ax
+
+    ; DI = backbuffer scanline Y + render_win_scol * 2
     mov     bx, cx
     shl     bx, 1
     mov     di, [cs:backbuffer_scanline_offsets + bx]
     xor     ax, ax
     mov     al, [cs:render_win_scol]
-    shl     ax, 1               ; * 2 bytes per tile column
+    shl     ax, 1
     add     di, ax
 
-    mov     al, cl
-    sub     al, [ds:0FF4Ah]     ; win_y = Y - WY
-    mov     ah, al
-    and     ah, 07h
-    shl     ah, 1
-    mov     [cs:render_fine_y], ah
+    mov     ch, 20
+    sub     ch, [cs:render_win_scol]
+    xor     cl, cl
+    push    bp
+    call    render_aligned_strip
+    pop     bp
 
-    shr     al, 3
+    mov     cx, [cs:render_y]
     xor     ah, ah
-    shl     ax, 5
-    add     ax, [cs:render_map_base]
-    mov     [cs:render_row_base], ax
-
-    xor     bp, bp
-    mov     bl, [cs:render_win_scol]
-    xor     bh, bh
-    mov     bp, bx              ; BP = screen tile column (start_col..19)
-.win_tile_loop:
-    mov     ax, bp
-    xor     bx, bx
-    mov     bl, [cs:render_win_scol]
-    sub     ax, bx              ; win_col = BP - start_col
-    mov     si, [cs:render_row_base]
-    add     si, ax
-    mov     al, [ds:si]
-
-    cmp     byte [cs:render_unsigned_tile], 1
-    je      .win_unsigned_tile
-    cbw
-    shl     ax, 4
-    add     ax, 09000h
-    jmp     short .win_tile_addr_done
-.win_unsigned_tile:
-    xor     ah, ah
-    shl     ax, 4
-    add     ax, 08000h
-.win_tile_addr_done:
-    xor     bx, bx
-    mov     bl, [cs:render_fine_y]
-    mov     si, ax
-    add     si, bx
-
-    mov     al, [ds:si]
-    mov     ah, [ds:si+1]
-
-    mov     bl, al
-    shr     bl, 4
-    mov     bh, ah
-    and     bh, 0F0h
-    or      bl, bh
-    xor     bh, bh
-    mov     dl, [cs:dmg_cga_nibble_table + bx]
-
-    mov     bl, al
-    and     bl, 0Fh
-    mov     bh, ah
-    shl     bh, 4
-    or      bl, bh
-    xor     bh, bh
-    mov     dh, [cs:dmg_cga_nibble_table + bx]
-
-    mov     [es:di], dx
-    add     di, 2
-
-    inc     bp
-    cmp     bp, 20
-    jb      .win_tile_loop
-
-    pop     cx
-    inc     cx
+    mov     al, [cs:render_run_lines]
+    add     cx, ax
     cmp     cx, GB_SCREEN_HEIGHT
-    jb      near .win_line_loop
+    jb      near .win_strip_loop
 
 .skip_window:
     ; --------------------------------------------------------------------------
@@ -928,22 +978,41 @@ cga_render_gb_frame:
     mov     al, [ds:si+3]       ; Attributes
     mov     [cs:render_spr_attr], al
 
-    ; Palette: bit 4 selects OBP0 (0xFF48) or OBP1 (0xFF49)
+    ; Precompute CGA shades for sprite colors 1..3 once per visible sprite
     mov     dl, [ds:0FF48h]
     test    al, 10h
     jz      .spr_pal_ok
     mov     dl, [ds:0FF49h]
 .spr_pal_ok:
-    mov     [cs:render_spr_pal], dl
+    mov     bl, dl
+    shr     bl, 2
+    and     bx, 0003h
+    mov     al, [cs:cfg_shade0 + bx]
+    and     al, 03h
+    mov     [cs:render_spr_pal_tab + 1], al
 
-    xor      cx, cx             ; CX = row 0 .. spr_h-1
+    mov     bl, dl
+    shr     bl, 4
+    and     bx, 0003h
+    mov     al, [cs:cfg_shade0 + bx]
+    and     al, 03h
+    mov     [cs:render_spr_pal_tab + 2], al
+
+    shr     dl, 6
+    xor     bh, bh
+    mov     bl, dl
+    mov     al, [cs:cfg_shade0 + bx]
+    and     al, 03h
+    mov     [cs:render_spr_pal_tab + 3], al
+
+    xor     cx, cx              ; CL = row 0 .. spr_h-1
 .spr_row_loop:
     mov     al, [cs:render_spr_y]
     add     al, cl              ; screen_y = spr_y + row
     cmp     al, 144
     jae     near .spr_row_next  ; unsigned >= 144 also catches negative wrap!
 
-    ; Calculate backbuffer scanline pointer for screen_y
+    ; BP = backbuffer scanline pointer for screen_y
     xor     bx, bx
     mov     bl, al
     shl     bx, 1
@@ -967,91 +1036,45 @@ cga_render_gb_frame:
     add     ax, 08000h
     add     bx, ax              ; BX = GB VRAM tile row address
 
-    mov     al, [ds:bx]         ; B0
-    mov     ah, [ds:bx+1]       ; B1
+    mov     ax, [ds:bx]         ; AL = B0, AH = B1
+    test    ax, ax              ; Skip completely transparent rows immediately!
+    jz      near .spr_row_next
 
-    ; Loop 8 horizontal pixels (ch = 0..7)
-    xor     ch, ch
-.spr_px_loop:
     mov     dl, [cs:render_spr_x]
-    add     dl, ch              ; screen_x = spr_x + px
-    cmp     dl, 160
-    jae     .spr_px_next
-
-    ; Bit position in tile plane (handle X-flip bit 5)
-    push    cx
-    mov     cl, ch
+    mov     ch, 8               ; 8 pixels in row
     test    byte [cs:render_spr_attr], 20h
-    jnz     .xflip_ok
-    mov     cl, 7
-    sub     cl, ch
-.xflip_ok:
-    mov     dh, 1
-    shl     dh, cl              ; DH = bit mask for pixel
+    jnz     .spr_px_xflip
 
-    xor     bl, bl
-    test    ah, dh
-    jz      .sp_b1_0
-    or      bl, 02h
-.sp_b1_0:
-    test    al, dh
-    jz      .sp_b0_0
-    or      bl, 01h
-.sp_b0_0:
-    pop     cx
-    or      bl, bl              ; Color 0 is transparent!
-    jz      .spr_px_next
+.spr_px_norm:
+    xor     bx, bx
+    shl     ah, 1
+    adc     bl, bl
+    shl     al, 1
+    adc     bl, bl
+    jz      .spr_norm_next      ; Color 0 is transparent
+    cmp     dl, 160
+    jae     .spr_norm_next
+    call    spr_draw_pixel
+.spr_norm_next:
+    inc     dl
+    dec     ch
+    jnz     .spr_px_norm
+    jmp     short .spr_row_next
 
-    ; Map color 1..3 through OBP palette and cfg_shade0..3
-    push    ax
-    push    cx
-    mov     cl, bl
-    shl     cl, 1
-    mov     al, [cs:render_spr_pal]
-    shr     al, cl
-    and     al, 03h
-    xor     bh, bh
-    mov     bl, al
-    mov     al, [cs:cfg_shade0 + bx]
-    and     al, 03h             ; AL = 2-bit CGA pixel shade (0..3)
-
-    ; Write 2-bit pixel into ES:[bp + (screen_x >> 2)]
-    xor     bh, bh
-    mov     bl, dl
-    shr     bl, 2               ; byte offset 0..39
-    mov     di, bp
-    add     di, bx
-
-    mov     cl, dl
-    and     cl, 03h
-    xor     cl, 03h             ; (3 - (screen_x & 3))
-    shl     cl, 1               ; shift = 6, 4, 2, 0
-
-    ; Respect OAM attribute bit 7 (OBJ-to-BG Priority: 1 = behind BG colors 1..3)
-    test    byte [cs:render_spr_attr], 80h
-    jz      .spr_draw_px
-    mov     ah, [es:di]
-    shr     ah, cl
-    and     ah, 03h
-    cmp     ah, [cs:render_bg0_shade]
-    jne     .spr_skip_px
-
-.spr_draw_px:
-    mov     ah, 03h
-    shl     ah, cl
-    not     ah                  ; clear mask
-    shl     al, cl              ; shifted pixel bits
-
-    and     [es:di], ah
-    or      [es:di], al
-.spr_skip_px:
-    pop     cx
-    pop     ax
-
-.spr_px_next:
-    inc     ch
-    cmp     ch, 8
-    jb      .spr_px_loop
+.spr_px_xflip:
+    xor     bx, bx
+    shr     ah, 1
+    adc     bl, bl
+    shr     al, 1
+    adc     bl, bl
+    jz      .spr_xflip_next     ; Color 0 is transparent
+    cmp     dl, 160
+    jae     .spr_xflip_next
+    call    spr_draw_pixel
+.spr_xflip_next:
+    inc     dl
+    dec     ch
+    jnz     .spr_px_xflip
 
 .spr_row_next:
     inc     cl
@@ -1157,6 +1180,165 @@ update_cga_tile_cache:
 .cache_done:
     ret
 
+; ------------------------------------------------------------------------------
+; render_aligned_strip: Copy 1..8 scanlines of CH tile columns directly from
+; cga_tile_cache into backbuffer_seg (ES:DI).
+; Inputs: DS = gb_mem_seg, ES = backbuffer_seg, SI = map_row_base,
+;         BP = tile_cache_base (+ fine_y*2), CL = start_col, CH = tile_count,
+;         [cs:render_run_lines] = 1..8, [cs:render_unsigned_tile] = 0/1
+; Clobbers: AX, BX, CX, DX, DI
+; ------------------------------------------------------------------------------
+render_aligned_strip:
+    xor     bh, bh
+    mov     bl, [cs:render_run_lines]
+    dec     bx
+    shl     bx, 1
+    cmp     byte [cs:render_unsigned_tile], 1
+    je      .go_u
+    mov     dx, [cs:fu_s_tab + bx]
+.loop_s:
+    xor     bh, bh
+    mov     bl, cl
+    inc     cl
+    and     cl, 1Fh
+    mov     al, [ds:si + bx]
+    cbw
+    shl     ax, 4
+    add     ax, bp
+    mov     bx, ax
+    jmp     dx
+.fu_s_8: mov ax, [cs:bx+14]
+         mov [es:di+280], ax
+.fu_s_7: mov ax, [cs:bx+12]
+         mov [es:di+240], ax
+.fu_s_6: mov ax, [cs:bx+10]
+         mov [es:di+200], ax
+.fu_s_5: mov ax, [cs:bx+8]
+         mov [es:di+160], ax
+.fu_s_4: mov ax, [cs:bx+6]
+         mov [es:di+120], ax
+.fu_s_3: mov ax, [cs:bx+4]
+         mov [es:di+80], ax
+.fu_s_2: mov ax, [cs:bx+2]
+         mov [es:di+40], ax
+.fu_s_1: mov ax, [cs:bx]
+         mov [es:di], ax
+    add     di, 2
+    dec     ch
+    jnz     .loop_s
+    ret
+
+.go_u:
+    mov     dx, [cs:fu_u_tab + bx]
+.loop_u:
+    xor     bh, bh
+    mov     bl, cl
+    inc     cl
+    and     cl, 1Fh
+    mov     al, [ds:si + bx]
+    xor     ah, ah
+    shl     ax, 4
+    add     ax, bp
+    mov     bx, ax
+    jmp     dx
+.fu_u_8: mov ax, [cs:bx+14]
+         mov [es:di+280], ax
+.fu_u_7: mov ax, [cs:bx+12]
+         mov [es:di+240], ax
+.fu_u_6: mov ax, [cs:bx+10]
+         mov [es:di+200], ax
+.fu_u_5: mov ax, [cs:bx+8]
+         mov [es:di+160], ax
+.fu_u_4: mov ax, [cs:bx+6]
+         mov [es:di+120], ax
+.fu_u_3: mov ax, [cs:bx+4]
+         mov [es:di+80], ax
+.fu_u_2: mov ax, [cs:bx+2]
+         mov [es:di+40], ax
+.fu_u_1: mov ax, [cs:bx]
+         mov [es:di], ax
+    add     di, 2
+    dec     ch
+    jnz     .loop_u
+    ret
+
+; ------------------------------------------------------------------------------
+; spr_draw_pixel: Write one opaque sprite pixel at (screen_x=DL, row_base=ES:BP)
+; Inputs: BL = GB color (1..3), BH = 0, DL = screen_x (0..159), ES:BP = backbuffer line
+; Preserves: AX, CX, DX, BP, DS, ES
+; ------------------------------------------------------------------------------
+spr_draw_pixel:
+    push    ax
+    mov     al, [cs:render_spr_pal_tab + bx] ; AL = 2-bit CGA shade (0..3)
+    mov     bl, dl
+    shr     bl, 2               ; byte offset 0..39
+    mov     di, bp
+    add     di, bx              ; ES:DI = target CGA byte
+
+    mov     bl, dl
+    and     bl, 03h             ; BX = screen_x & 3 (0..3)
+
+    test    byte [cs:render_spr_attr], 80h
+    jz      short .draw_now
+
+    ; Respect OAM attribute bit 7 (OBJ-to-BG Priority: 1 = behind BG colors 1..3)
+    push    cx
+    mov     cl, [cs:spr_shift_tab + bx]
+    mov     ah, [es:di]
+    shr     ah, cl
+    pop     cx
+    and     ah, 03h
+    cmp     ah, [cs:render_bg0_shade]
+    jne     short .skip_draw
+
+.draw_now:
+    shl     al, 2
+    or      bl, al              ; BX = (shade << 2) | (x & 3)
+    mov     ah, [cs:spr_or_tab + bx]
+    and     bl, 03h
+    mov     al, [cs:spr_and_tab + bx]
+    and     [es:di], al
+    or      [es:di], ah
+.skip_draw:
+    pop     ax
+    ret
+
+fu_u_tab:
+    dw render_aligned_strip.fu_u_1, render_aligned_strip.fu_u_2
+    dw render_aligned_strip.fu_u_3, render_aligned_strip.fu_u_4
+    dw render_aligned_strip.fu_u_5, render_aligned_strip.fu_u_6
+    dw render_aligned_strip.fu_u_7, render_aligned_strip.fu_u_8
+
+fu_s_tab:
+    dw render_aligned_strip.fu_s_1, render_aligned_strip.fu_s_2
+    dw render_aligned_strip.fu_s_3, render_aligned_strip.fu_s_4
+    dw render_aligned_strip.fu_s_5, render_aligned_strip.fu_s_6
+    dw render_aligned_strip.fu_s_7, render_aligned_strip.fu_s_8
+
+sc_u_tab:
+    dw cga_render_gb_frame.sc_u_1, cga_render_gb_frame.sc_u_2
+    dw cga_render_gb_frame.sc_u_3, cga_render_gb_frame.sc_u_4
+    dw cga_render_gb_frame.sc_u_5, cga_render_gb_frame.sc_u_6
+    dw cga_render_gb_frame.sc_u_7, cga_render_gb_frame.sc_u_8
+
+sc_s_tab:
+    dw cga_render_gb_frame.sc_s_1, cga_render_gb_frame.sc_s_2
+    dw cga_render_gb_frame.sc_s_3, cga_render_gb_frame.sc_s_4
+    dw cga_render_gb_frame.sc_s_5, cga_render_gb_frame.sc_s_6
+    dw cga_render_gb_frame.sc_s_7, cga_render_gb_frame.sc_s_8
+
+spr_shift_tab:
+    db 6, 4, 2, 0
+
+spr_and_tab:
+    db 03Fh, 0CFh, 0F3h, 0FCh
+
+spr_or_tab:
+    db 000h, 000h, 000h, 000h
+    db 040h, 010h, 004h, 001h
+    db 080h, 020h, 008h, 002h
+    db 0C0h, 030h, 00Ch, 003h
+
     align 16
 global tile_dirty
 tile_dirty:
@@ -1175,8 +1357,6 @@ backbuffer_scanline_offsets:
 
 ; Rendering scratch variables in CS
 render_map_base:        dw 09800h
-render_row_base:        dw 0
-render_fine_y:          db 0
 render_unsigned_tile:   db 1
 render_scy:             db 0
 render_scx:             db 0
@@ -1189,11 +1369,14 @@ render_spr_y:           db 0
 render_spr_x:           db 0
 render_spr_tile:        db 0
 render_spr_attr:        db 0
-render_spr_pal:         db 0
+render_spr_pal_tab:     db 0, 0, 0, 0
 render_win_scol:        db 0
 last_bgp:               db 0FFh
 render_bg0_shade:       db 0
-render_tile_col:        db 0
 render_fine_x:          db 0
-render_tile_cnt:        db 20
-cga_line_buf:           times 44 db 0
+render_split_limit:     db 0
+render_run_lines:       db 0
+render_row_cnt:         db 0
+render_y:               dw 0
+render_dest_di:         dw 0
+cga_strip_buf:          times (8 * 44) db 0
