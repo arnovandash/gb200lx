@@ -438,15 +438,43 @@ helper_halt:
     cmp     byte [cs:exit_requested], 1
     je      .do_exit
 
-    ; Clear per-frame press latches before rendering so any tap during render is caught
+    ; --- Fixed 59.73 Hz frame pacing (INT 08h ticks) with adaptive frameskip ---
+    ; Game logic always advances exactly one GB frame per tick, so game speed
+    ; and input timing stay constant; rendering is skipped when we fall behind.
+.pace_wait:
+    cmp     word [cs:frame_ticks], 0
+    jne     .pace_have_tick
+    sti
+    hlt                                 ; Sleep until next timer IRQ
+    jmp     short .pace_wait
+.pace_have_tick:
+    cli
+    mov     ax, [cs:frame_ticks]
+    dec     ax
+    cmp     ax, MAX_FRAME_BACKLOG       ; Hopelessly behind: drop backlog
+    jbe     .pace_store
+    xor     ax, ax
+.pace_store:
+    mov     [cs:frame_ticks], ax
+    sti
+
+    ; Clear per-frame press latches so any tap until the next HALT is caught
     mov     byte [cs:joypad_dir_latch], 0FFh
     mov     byte [cs:joypad_act_latch], 0FFh
 
+    test    ax, ax                      ; Still behind schedule?
+    jz      .do_render
+    cmp     byte [cs:skip_run], MAX_FRAME_SKIP
+    jae     .do_render
+    inc     byte [cs:skip_run]
+    jmp     short .after_render
+.do_render:
+    mov     byte [cs:skip_run], 0
     ; Render CGA frame (needs DS = gb_mem_seg)
     mov     ax, [cs:gb_mem_seg]
     mov     ds, ax
     call    cga_render_gb_frame
-
+.after_render:
     ; Auto-exit test counter check (/t)
     cmp     word [cs:auto_exit_frames], 0
     je      .check_keys
@@ -693,6 +721,9 @@ current_rom_bank:   db  1       ; Currently selected 16 KiB ROM bank (1..3)
 rom_bank_mask:      db  03h     ; ROM bank bitmask (default 03h for 4 banks)
 emulated_ly:        db  148     ; Current emulated scanline (default 148 = 0x94 VBlank)
 div_counter:        db  0       ; DIV register counter
+skip_run:           db  0       ; Consecutive frames whose render was skipped
+MAX_FRAME_SKIP      equ 3       ; Render at least every 4th frame (>= 15 fps)
+MAX_FRAME_BACKLOG   equ 6       ; Drop pending ticks beyond this (avoid spiral)
 
 global joypad_dir, joypad_act, joypad_dir_latch, joypad_act_latch
 joypad_dir:         db  0Fh     ; Bits 3..0: Down, Up, Left, Right (1=released, 0=pressed)

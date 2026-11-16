@@ -117,6 +117,9 @@ entry:
     ; 7. Hook INT 09h (Keyboard IRQ1) for joypad input and ESC exit
     call    hook_int09
 
+    ; 7b. Hook INT 08h + reprogram PIT ch0 to the Game Boy frame rate (59.73 Hz)
+    call    hook_int08
+
     ; 8. Switch to CGA Mode 04h (320x200 4-shade grayscale on HP 200LX)
     call    cga_init
 
@@ -227,6 +230,9 @@ game_clean_exit:
     ; Restore original INT 09h vector
     call    unhook_int09
 
+    ; Restore PIT to 18.2 Hz and original INT 08h vector
+    call    unhook_int08
+
     ; Print exit message and return to DOS
     mov     ax, cs
     mov     ds, ax
@@ -266,6 +272,65 @@ unhook_int09:
     int     21h
     pop     ds
     ret
+
+; ------------------------------------------------------------------------------
+; INT 08h Timer ISR: 59.73 Hz Game Boy frame clock
+; PIT ch0 runs at 1193182 / GB_PIT_DIVISOR Hz. Each IRQ adds one pending frame
+; tick consumed by helper_halt. The original BIOS handler is chained at the
+; average 18.2 Hz rate (accumulator overflow) so the DOS clock stays correct.
+; ------------------------------------------------------------------------------
+GB_PIT_DIVISOR  equ 19977               ; 1193182 / 59.7275 Hz
+
+hook_int08:
+    push    es
+    mov     ax, 3508h
+    int     21h
+    mov     [old_int08_off], bx
+    mov     [old_int08_seg], es
+    pop     es
+    mov     dx, int08_handler           ; DS = CS here
+    mov     ax, 2508h
+    int     21h
+    cli
+    mov     al, 36h                     ; ch0, lo/hi byte, mode 3
+    out     43h, al
+    mov     ax, GB_PIT_DIVISOR
+    out     40h, al
+    mov     al, ah
+    out     40h, al
+    sti
+    ret
+
+unhook_int08:
+    cli
+    mov     al, 36h
+    out     43h, al
+    xor     al, al                      ; divisor 0 = 65536 (18.2 Hz)
+    out     40h, al
+    out     40h, al
+    sti
+    push    ds
+    mov     dx, [cs:old_int08_off]
+    mov     ds, [cs:old_int08_seg]
+    mov     ax, 2508h
+    int     21h
+    pop     ds
+    ret
+
+int08_handler:
+    push    ax
+    inc     word [cs:frame_ticks]
+    mov     ax, [cs:pit_accum]
+    add     ax, GB_PIT_DIVISOR
+    mov     [cs:pit_accum], ax
+    jc      .chain_bios                 ; 65536 PIT clocks elapsed -> BIOS tick
+    mov     al, 20h
+    out     20h, al
+    pop     ax
+    iret
+.chain_bios:
+    pop     ax
+    jmp     far [cs:old_int08_off]
 
 int09_handler:
     push    ax
@@ -465,6 +530,11 @@ auto_exit_frames:   dw  0
 
 old_int09_off:      dw  0
 old_int09_seg:      dw  0
+old_int08_off:      dw  0
+old_int08_seg:      dw  0
+pit_accum:          dw  0
+global frame_ticks
+frame_ticks:        dw  0               ; Pending 59.73 Hz frame ticks (INT 08h)
 
 global seg_bank0, seg_bank1, seg_bank2, seg_bank3, seg_rom_data
 seg_bank0:          dw  0
