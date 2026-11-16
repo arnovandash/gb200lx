@@ -560,6 +560,11 @@ cga_render_gb_frame:
     je      .bgp_ok
     mov     [cs:last_bgp], al
     call    helper_update_bgp
+    mov     bl, [ds:0FF47h]
+    and     bx, 0003h
+    mov     al, [cs:cfg_shade0 + bx]
+    and     al, 03h
+    mov     [cs:render_bg0_shade], al
 .bgp_ok:
     mov     al, [ds:0FF40h]
 
@@ -640,7 +645,7 @@ cga_render_gb_frame:
     mov     ah, al
     and     ah, 07h             ; AH = fine_x (0..7)
     shr     al, 3               ; AL = starting tile_col (0..31)
-    mov     [cs:render_tile_col], al
+    mov     cl, al              ; CL = tile_col (0..31)
 
     ; If fine_x == 0: render 20 tiles directly to ES:DI (cga_backbuffer)
     ; If fine_x != 0: render 21 tiles to cga_line_buf, then shift left by fine_x pixels into ES:DI
@@ -649,11 +654,11 @@ cga_render_gb_frame:
     mov     [cs:render_fine_x], ah
     push    di                  ; Save backbuffer scanline ptr
     mov     di, cga_line_buf
-    mov     byte [cs:render_tile_cnt], 21
+    mov     ch, 21              ; CH = tile count
     jmp     short .start_tiles
 .direct_line:
     mov     byte [cs:render_fine_x], 0
-    mov     byte [cs:render_tile_cnt], 20
+    mov     ch, 20              ; CH = tile count
 
 .start_tiles:
     ; Precompute tile_data_base = (0x8000 or 0x9000) + fine_y in BP
@@ -667,10 +672,9 @@ cga_render_gb_frame:
     lea     bp, [bx + 08000h]
 
 .tile_loop_unsigned:
-    xor     bh, bh
-    mov     bl, [cs:render_tile_col]
-    inc     byte [cs:render_tile_col]
-    and     byte [cs:render_tile_col], 1Fh
+    mov     bl, cl
+    inc     cl
+    and     cl, 1Fh
     mov     si, [cs:render_row_base]
     mov     al, [ds:si + bx]
     xor     ah, ah
@@ -700,15 +704,14 @@ cga_render_gb_frame:
     mov     [es:di], dx
     add     di, 2
 
-    dec     byte [cs:render_tile_cnt]
+    dec     ch
     jnz     .tile_loop_unsigned
     jmp     short .tiles_done
 
 .tile_loop_signed:
-    xor     bh, bh
-    mov     bl, [cs:render_tile_col]
-    inc     byte [cs:render_tile_col]
-    and     byte [cs:render_tile_col], 1Fh
+    mov     bl, cl
+    inc     cl
+    and     cl, 1Fh
     mov     si, [cs:render_row_base]
     mov     al, [ds:si + bx]
     cbw
@@ -738,7 +741,7 @@ cga_render_gb_frame:
     mov     [es:di], dx
     add     di, 2
 
-    dec     byte [cs:render_tile_cnt]
+    dec     ch
     jnz     .tile_loop_signed
 
 .tiles_done:
@@ -1041,6 +1044,16 @@ cga_render_gb_frame:
     xor     cl, 03h             ; (3 - (screen_x & 3))
     shl     cl, 1               ; shift = 6, 4, 2, 0
 
+    ; Respect OAM attribute bit 7 (OBJ-to-BG Priority: 1 = behind BG colors 1..3)
+    test    byte [cs:render_spr_attr], 80h
+    jz      .spr_draw_px
+    mov     ah, [es:di]
+    shr     ah, cl
+    and     ah, 03h
+    cmp     ah, [cs:render_bg0_shade]
+    jne     .spr_skip_px
+
+.spr_draw_px:
     mov     ah, 03h
     shl     ah, cl
     not     ah                  ; clear mask
@@ -1048,6 +1061,7 @@ cga_render_gb_frame:
 
     and     [es:di], ah
     or      [es:di], al
+.spr_skip_px:
     pop     cx
     pop     ax
 
@@ -1131,6 +1145,7 @@ render_spr_attr:        db 0
 render_spr_pal:         db 0
 render_win_scol:        db 0
 last_bgp:               db 0FFh
+render_bg0_shade:       db 0
 render_tile_col:        db 0
 render_fine_x:          db 0
 render_tile_cnt:        db 20

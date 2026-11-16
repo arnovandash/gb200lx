@@ -327,6 +327,7 @@ class CodeGenerator80186:
     def __init__(self, disasm: SM83Disassembler):
         self.disasm = disasm
         self.labels: Set[Tuple[int, int]] = set()
+        self.last_alu_sub: bool = False
 
     def label_name(self, bank: int, addr: int) -> str:
         # Bank 0 is always in segment 0
@@ -358,7 +359,7 @@ class CodeGenerator80186:
         if m == "CCF":
             return ["cmc"]
         if m == "DAA":
-            return ["daa"]
+            return ["das"] if self.last_alu_sub else ["daa"]
 
         # Rotates on A
         if m == "RLCA":
@@ -510,6 +511,10 @@ class CodeGenerator80186:
         }
         for gb_alu, x86_alu in alu_ops.items():
             if m.startswith(f"{gb_alu} A, "):
+                if gb_alu in ("SUB", "SBC"):
+                    self.last_alu_sub = True
+                elif gb_alu in ("ADD", "ADC"):
+                    self.last_alu_sub = False
                 src = m.split(", ")[1]
                 if src == "A" and gb_alu == "XOR":
                     return ["xor al, al"]
@@ -525,6 +530,8 @@ class CodeGenerator80186:
         # Note: In SM83, 16-bit INC/DEC rr preserves ALL CPU flags (ZF and CF)!
         if m.startswith("INC "):
             r = m[4:]
+            if r == "A":
+                self.last_alu_sub = False
             if r in REG8_TO_X86:
                 return [f"inc {REG8_TO_X86[r]}"]
             elif r == "(HL)":
@@ -538,6 +545,8 @@ class CodeGenerator80186:
 
         if m.startswith("DEC "):
             r = m[4:]
+            if r == "A":
+                self.last_alu_sub = True
             if r in REG8_TO_X86:
                 return [f"dec {REG8_TO_X86[r]}"]
             elif r == "(HL)":
