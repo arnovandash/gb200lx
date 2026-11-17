@@ -28,13 +28,15 @@
   - *Super Mario Land (World) (Rev 1)* — full gameplay including `STAT`/`LYC` split-scroll HUD, 1-pixel `SCX` scrolling, sprites, pipes (OAM BG priority), and BCD timer.
   - *Tetris - Rosy Retrospection (v1.2)* — Window/BG rendering and gameplay.
   - *Bubble Ghost (USA, Europe)* — sprites, Window HUD, and full-speed gameplay.
-- **Banked (> 64 KiB) Titles:**
-  - *The Legend of Zelda: Link's Awakening* (MBC1, 512 KiB) — intro, file select, and in-game (`cycles=fixed 7910` runs at 60 FPS with dynamic cache sizing and zero-copy ROM bank reads).
-  - *Pokémon Blue* (MBC3, 1 MiB, 32 KiB SRAM) — copyright, Game Freak/Nidorino vs Gengar intro, and animated Start screen.
-  - *Final Fantasy Adventure* (MBC2, 256 KiB) — title and `New Game / Continue` menu (text overlaps the title logo; known rendering issue).
-  - *Final Fantasy Legend III* (MBC1, 256 KiB) — title screen, waiting for input.
+  - *The Legend of Zelda: Link's Awakening* (MBC1, 512 KiB) — intro, file select, and in-game exploration at 60 FPS (`cycles=fixed 7910`); NPCs (Marin, Tarin), dialogs, and entity interactions verified via slot-isolated jump tables and paired bank+pointer tables.
+- **Banked (> 64 KiB) Titles & In-Progress Testing:**
+  - *Pokémon Blue* (MBC3, 1 MiB, 32 KiB SRAM) — copyright, Game Freak intro, title screen, and Main Menu loop unblocked via back-edge timer yielding (`helper_yield_if_ticks`). Window text tiles currently undergoing VBlank DMA verification.
+  - *Final Fantasy Adventure* (MBC2, 256 KiB) — title and `New Game / Continue` menu (text overlaps title logo; known rendering issue).
+  - *Final Fantasy Legend III* (MBC1, 256 KiB) — title screen and input handling; New Game transition under diagnostic analysis.
+- **Engineering Documentation:**
+  - See [docs/DYNAMIC_BANKING_INVESTIGATION.md](docs/DYNAMIC_BANKING_INVESTIGATION.md) for the complete engineering log, root cause analyses, attempted fixes, and technical roadmap for dynamic banking (> 64 KiB).
 - **Current Limitations:**
-  - Banked (> 64 KiB) support is new. Headless runs reach title/intro screens; full gameplay has not yet been verified. Cartridge SRAM is emulated in memory but not yet saved to disk.
+  - Cartridge SRAM persistence (`CARTRAM.SAV`) is currently in design/implementation (Save States `F5`/`F9` work).
   - MBC5 and Game Boy Color (`.gbc`) ROMs are not supported.
   - Audio maps Game Boy Channels 1, 2 (square + sweep/envelope/length) and Channel 3 (wave fallback) to the single-voice HP 200LX PC speaker (Channel 4 noise is omitted).
 
@@ -118,7 +120,7 @@ Place `GB200LX.INI` in the same directory as the executable (auto-created with d
 ```ini
 [video]
 scaling = center          ; center (160x144) or wide (320x144 2x horizontal stretch)
-palette = pocket          ; pocket, dmg, high_con, dark
+palette = dark            ; dark (default for HP 200LX LCD), pocket, dmg, high_con
 vsync = 1                 ; 1 = wait for CGA VRetrace (0x03DA bit 3), 0 = off
 sound = 1                 ; 1 = PC speaker sound on, 0 = mute
 

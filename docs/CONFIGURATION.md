@@ -19,7 +19,7 @@ If `GB200LX.INI` is missing when the executable starts, it is automatically crea
 ```ini
 [video]
 scaling = center
-palette = pocket
+palette = dark
 vsync = 1
 sound = 1
 
@@ -39,7 +39,7 @@ key_menu = ESC
 
 | Parameter | Options | Default | Notes |
 | :--- | :--- | :--- | :--- |
-| **`palette`** | `pocket`, `dmg`, `high_con`, `dark` | `pocket` | Selects the 4-shade CGA grayscale mapping (`cfg_shade0..3`) and BIOS CGA palette. |
+| **`palette`** | `pocket`, `dmg`, `high_con`, `dark` | `dark` | Selects the 4-shade CGA grayscale mapping (`cfg_shade0..3`) and BIOS CGA palette. Defaults to `dark` for maximum LCD legibility on HP 200LX. |
 | **`scaling`** | `center`, `wide` | `center` | `center` = 160×144 centered at `(80, 28)`; `wide` = 2× horizontal stretch (`320×144`). |
 | **`vsync`** | `1`, `0` | `1` | Waits for CGA vertical retrace (`0x03DA` bit 3) before blitting when `1`. |
 | **`sound`** | `1`, `0` | `1` | Enables (`1`) or mutes (`0`) PC speaker APU synthesis on PIT Channel 2. |
@@ -48,10 +48,10 @@ key_menu = ESC
 
 | Palette | Shade 0 | Shade 1 | Shade 2 | Shade 3 | Notes |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`pocket`** | White (`00b`) | Light Gray (`01b`) | Dark Gray (`10b`) | Black (`11b`) | Crisp 4-shade mapping + CGA Palette 0 (default) |
+| **`dark`** | Black (`11b`) | Dark Gray (`10b`) | Light Gray (`01b`) | White (`00b`) | Inverted dark-background mode + CGA Palette 1 (default; best legibility on HP 200LX) |
+| **`pocket`** | White (`00b`) | Light Gray (`01b`) | Dark Gray (`10b`) | Black (`11b`) | Crisp 4-shade mapping + CGA Palette 0 |
 | **`dmg`** | White (`00b`) | Light Gray (`01b`) | Black (`11b`) | Black (`11b`) | Bold DMG contrast + CGA Palette 0 green BG |
 | **`high_con`** | White (`00b`) | White (`00b`) | Black (`11b`) | Black (`11b`) | Maximum 2-shade B&W contrast + CGA Palette 1 |
-| **`dark`** | Black (`11b`) | Dark Gray (`10b`) | Light Gray (`01b`) | White (`00b`) | Inverted dark-background mode + CGA Palette 1 |
 
 ---
 

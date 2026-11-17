@@ -757,6 +757,11 @@ helper_read_div:
 global helper_read_ly
 helper_read_ly:
     pushf
+    cmp     word [cs:wdog_ticks], 360
+    jb      short .ly_no_wdog
+    popf
+    jmp     near wdog_abort
+.ly_no_wdog:
     ; Cycle LY through 0..153 to satisfy busy-wait loops
     inc     byte [cs:emulated_ly]
     cmp     byte [cs:emulated_ly], 154
@@ -797,7 +802,8 @@ helper_read_stat:
 ; helper_halt: Game Boy HALT instruction
 ; Yields execution, renders frame, checks keys, and fires VBlank/STAT/Timer ISRs
 ; ------------------------------------------------------------------------------
-global helper_halt
+global helper_halt, in_halt_isr
+in_halt_isr:        db 0
 helper_halt:
     pushf
     push    ax
@@ -809,6 +815,8 @@ helper_halt:
     push    ds
     push    es
     push    bp
+    mov     word [cs:wdog_ticks], 0
+    mov     [cs:last_halt_di], di
 
     ; Check if ESC / exit was requested
     cmp     byte [cs:exit_requested], 1
@@ -889,6 +897,9 @@ helper_halt:
     jmp     short .check_keys
 
 .check_vblank:
+    cmp     byte [cs:in_halt_isr], 0
+    jne     .done
+    mov     byte [cs:in_halt_isr], 1
     mov     ax, [cs:gb_mem_seg]
     mov     ds, ax
 
@@ -957,9 +968,30 @@ helper_halt:
     call    near loc_00_0050
 
 .done:
+    mov     byte [cs:in_halt_isr], 0
     ; Reset LY to active frame start (0) when returning from VBlank frame tick
     mov     byte [cs:emulated_ly], 0
     call    apu_frame_tick
+    popf
+    ret
+
+; ------------------------------------------------------------------------------
+; helper_yield_if_ticks: Yield via helper_halt only if >= 2 INT 08h ticks
+; (~33 ms) have elapsed without HALT (catches interrupt-driven polling loops
+; that lack HALT while keeping normal fast loops zero-overhead).
+; Preserves all registers and CPU flags!
+; ------------------------------------------------------------------------------
+global helper_yield_if_ticks
+helper_yield_if_ticks:
+    sti
+    pushf
+    cmp     word [cs:frame_ticks], 2
+    jb      short .hy_no
+    cmp     byte [cs:in_halt_isr], 0
+    jne     short .hy_no
+    popf
+    jmp     near helper_halt
+.hy_no:
     popf
     ret
 
@@ -1025,6 +1057,11 @@ SEG0_BRIDGE helper_update_bgp, 0018h
 SEG0_BRIDGE helper_halt, 001Ch
 SEG0_BRIDGE helper_mark_tile_dirty, 0020h
 SEG0_BRIDGE helper_read_stat, 0024h
+%ifdef OVL_MODE
+SEG0_BRIDGE helper_yield_if_ticks, 002Eh
+%else
+SEG0_BRIDGE helper_yield_if_ticks, 0028h
+%endif
 
 %ifdef OVL_MODE
 global helper_dispatch_any_bp

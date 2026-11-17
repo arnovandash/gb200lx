@@ -58,7 +58,7 @@ cfg_set_defaults:
     push    ax
 
     mov     byte [cfg_scaling],   SCALE_CENTER
-    mov     byte [cfg_palette],   PAL_POCKET
+    mov     byte [cfg_palette],   PAL_DARK
     mov     byte [cfg_border],    1
     mov     byte [cfg_vsync],     1
     mov     byte [cfg_frameskip], 0
@@ -1053,7 +1053,7 @@ global cfg_key_a, cfg_key_b, cfg_key_select, cfg_key_start, cfg_key_menu
 global cfg_shade0, cfg_shade1, cfg_shade2, cfg_shade3
 
 cfg_scaling:        db SCALE_CENTER
-cfg_palette:        db PAL_POCKET
+cfg_palette:        db PAL_DARK
 cfg_border:         db 1
 cfg_vsync:          db 1
 cfg_frameskip:      db 0

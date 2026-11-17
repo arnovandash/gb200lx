@@ -566,6 +566,30 @@ ovl_call_bp:
     jb      .ocb_bank_ok
     mov     al, 1
 .ocb_bank_ok:
+    mov     [cs:last_ovl_bk], al
+    mov     dx, [bp + 0]
+    mov     [cs:last_ovl_bp], dx
+    cmp     word [cs:auto_exit_frames], 100
+    ja      short .ocb_no_tr
+    cmp     al, 3
+    jne     short .ocb_do_tr
+    cmp     dx, 04000h
+    je      short .ocb_no_tr
+.ocb_do_tr:
+    push    bx
+    mov     bx, [cs:trace_cnt]
+    and     bx, 31
+    shl     bx, 2
+    mov     [cs:trace_ring + bx], ax
+    mov     [cs:trace_ring + bx + 2], dx
+    inc     word [cs:trace_cnt]
+    pop     bx
+    call    trace_log_call
+.ocb_no_tr:
+    cmp     word [cs:wdog_ticks], 360
+    jb      short .ocb_no_wdog
+    jmp     near wdog_abort
+.ocb_no_wdog:
     call    ovl_ensure_code_bank    ; SI = bank ID, ES = slot_seg
     mov     [bp + 18], si
     mov     [bp + 22], es
@@ -638,6 +662,17 @@ ovl_call_bp:
     ret
 
 .ocb_miss:
+    push    ax
+    push    bx
+    push    dx
+    mov     al, [cs:current_rom_bank]
+    mov     ah, 01h                 ; tag 01 = ocb_miss
+    mov     bx, [bp + 0]
+    mov     dx, [bp + 24]
+    call    log_miss
+    pop     dx
+    pop     bx
+    pop     ax
     pop     bp
     pop     es
     pop     ds

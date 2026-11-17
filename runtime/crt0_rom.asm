@@ -29,6 +29,7 @@ entry:
     ;   DS, ES = PSP segment
     mov     ax, cs
     mov     ds, ax                  ; DS = program segment (ES preserved as PSP!)
+    mov     [init_sp], sp
     mov     ax, [es:0002h]          ; Save PSP top-of-DOS-memory segment
     mov     [psp_mem_top], ax
 
@@ -133,6 +134,9 @@ entry:
     ; 7b. Hook INT 08h + reprogram PIT ch0 to the Game Boy frame rate (59.73 Hz)
     call    hook_int08
 
+    ; 7c. Hook INT 06h (Invalid Opcode CPU Exception) for crash diagnostics
+    call    hook_int06
+
     ; 8. Switch to CGA Mode 04h (320x200 4-shade grayscale on HP 200LX)
     call    cga_init
 
@@ -218,7 +222,7 @@ main_game_loop:
     dec     word [cs:auto_exit_frames]
     jnz     .check_bios_key
     mov     byte [cs:exit_requested], 1
-    jmp     short .frame_loop
+    jmp     near .frame_loop
 
 .check_bios_key:
     mov     ah, 01h
@@ -229,11 +233,36 @@ main_game_loop:
     cmp     al, 1Bh                     ; ESC key
     jne     .frame_loop
     mov     byte [cs:menu_requested], 1
-    jmp     short .frame_loop
+    jmp     near .frame_loop
 
 .do_game_exit:
 global game_clean_exit
 game_clean_exit:
+    mov     es, [cs:gb_mem_seg]
+    mov     ax, 0FA00h
+    mov     bx, [es:0FF40h]
+    mov     dx, [es:0FF47h]
+    call    log_miss
+    mov     ax, 0FB00h
+    mov     bx, [es:0FF42h]
+    mov     dx, [es:0FFBAh]
+    call    log_miss
+    mov     ax, 0FC00h
+    mov     bx, [es:09842h]
+    mov     dx, [es:0C3E2h]
+    call    log_miss
+    mov     ax, 0FD00h
+    mov     bx, [cs:last_ovl_bk]
+    mov     dx, [cs:last_ovl_bp]
+    call    log_miss
+    mov     ax, 0FE00h
+    mov     bx, [es:0FF4Ah]
+    mov     dx, [es:097F0h]
+    call    log_miss
+    mov     ax, 0FF00h
+    mov     bx, [es:088D0h]
+    mov     dx, [cs:cga_tile_cache + 08D0h]
+    call    log_miss
     ; Dump CGA VRAM for test verification
     call    dump_cga_vram
 
@@ -248,6 +277,9 @@ game_clean_exit:
 
     ; Restore PIT to 18.2 Hz and original INT 08h vector
     call    unhook_int08
+
+    ; Restore original INT 06h vector
+    call    unhook_int06
 
 %ifdef OVL_MODE
     call    ovl_close
@@ -292,6 +324,105 @@ unhook_int09:
     int     21h
     pop     ds
     ret
+
+; ------------------------------------------------------------------------------
+; INT 06h Invalid Opcode CPU Exception Hook
+; ------------------------------------------------------------------------------
+hook_int06:
+    push    es
+    mov     ax, 3506h
+    int     21h
+    mov     [old_int06_off], bx
+    mov     [old_int06_seg], es
+    pop     es
+    mov     dx, int06_handler           ; DS = CS here
+    mov     ax, 2506h
+    int     21h
+    ret
+
+unhook_int06:
+    push    ds
+    mov     dx, [cs:old_int06_off]
+    mov     ds, [cs:old_int06_seg]
+    mov     ax, 2506h
+    int     21h
+    pop     ds
+    ret
+
+int06_handler:
+    cli
+    push    bp
+    mov     bp, sp
+    mov     ax, [bp + 2]                ; Faulting IP
+    mov     [cs:int06_ip], ax
+    mov     ax, [bp + 4]                ; Faulting CS
+    mov     [cs:int06_cs], ax
+    mov     es, ax
+    mov     si, [cs:int06_ip]
+    mov     ax, [es:si]                 ; First 2 opcode bytes at CS:IP
+    mov     [cs:int06_op], ax
+    mov     [cs:int06_di], di
+
+    mov     ax, cs
+    mov     ss, ax
+    mov     sp, [cs:init_sp]
+    mov     ds, ax
+    mov     es, ax
+
+    mov     ah, 06h
+    mov     al, [current_rom_bank]
+    mov     bx, [int06_ip]
+    mov     dx, [int06_cs]
+    call    log_miss
+    mov     ax, 0601h
+    mov     bx, [int06_op]
+    mov     dx, [int06_di]
+    call    log_miss
+
+    call    cga_restore_text
+    call    unhook_int09
+    call    spk_mute
+    call    unhook_int08
+    call    unhook_int06
+%ifdef OVL_MODE
+    call    ovl_close
+%endif
+
+    mov     ax, [int06_cs]
+    mov     si, msg_int06_cs
+    call    .fmt_hex16
+    mov     ax, [int06_ip]
+    mov     si, msg_int06_ip
+    call    .fmt_hex16
+
+    mov     dx, msg_int06_crash
+    call    print_dos_string
+
+    mov     ax, 4C06h
+    int     21h
+
+.fmt_hex16:
+    mov     cx, 4
+.fh_loop:
+    rol     ax, 4
+    mov     bx, ax
+    and     bx, 0Fh
+    mov     dl, [hex_digits + bx]
+    mov     [si], dl
+    inc     si
+    loop    .fh_loop
+    ret
+
+old_int06_off:      dw  0
+old_int06_seg:      dw  0
+int06_ip:           dw  0
+int06_cs:           dw  0
+int06_op:           dw  0
+int06_di:           dw  0
+hex_digits:         db  "0123456789ABCDEF"
+msg_int06_crash:    db  0Dh, 0Ah, "CRASH: Invalid Opcode (INT 06h) at CS:IP = "
+msg_int06_cs:       db  "0000:"
+msg_int06_ip:       db  "0000", 0Dh, 0Ah, "$"
 
 ; ------------------------------------------------------------------------------
 ; INT 08h Timer ISR: 59.73 Hz Game Boy frame clock
@@ -340,6 +471,24 @@ unhook_int08:
 int08_handler:
     push    ax
     inc     word [cs:frame_ticks]
+    inc     word [cs:wdog_ticks]
+    cmp     word [cs:wdog_ticks], 180
+    jb      .no_wdog
+    cmp     byte [cs:wdog_fired], 0
+    jne     .no_wdog
+    mov     byte [cs:wdog_fired], 1
+    push    bp
+    mov     bp, sp
+    mov     ax, [bp + 4]
+    mov     [cs:wdog_ip], ax
+    mov     ax, [bp + 6]
+    mov     [cs:wdog_cs], ax
+    mov     [cs:wdog_di], di
+    mov     word [bp + 4], wdog_abort
+    mov     word [bp + 6], cs
+    or      word [bp + 8], 0200h
+    pop     bp
+.no_wdog:
     mov     ax, [cs:pit_accum]
     add     ax, GB_PIT_DIVISOR
     mov     [cs:pit_accum], ax
@@ -538,6 +687,20 @@ dump_cga_vram:
     mov     ah, 3Eh
     int     21h
 
+    mov     ax, cs
+    mov     ds, ax
+    mov     dx, fn_misses
+    mov     ah, 3Ch
+    xor     cx, cx
+    int     21h
+    jc      .dump_done
+    mov     bx, ax
+    mov     dx, miss_cnt
+    mov     cx, 386
+    mov     ah, 40h
+    int     21h
+    mov     ah, 3Eh
+    int     21h
 .dump_done:
     pop     ds
     pop     dx
@@ -557,6 +720,73 @@ print_dos_string:
 ; Variables & Constants
 ; ------------------------------------------------------------------------------
 fn_vram_dump:       db  "CGA_VRAM.BIN", 0
+fn_misses:          db  "MISSES.BIN", 0
+global log_miss
+miss_cnt:           dw  0
+miss_buf:           times 192 dw 0   ; 64 x (tag_bank, addr, extra)
+log_miss:
+    pushf
+    push    ax
+    push    bx
+    push    cx
+    push    si
+    push    di
+    mov     si, [cs:miss_cnt]
+    xor     di, di
+.lm_chk:
+    cmp     di, si
+    jae     .lm_add
+    mov     cx, di
+    shl     cx, 1
+    add     cx, di
+    shl     cx, 1
+    mov     bp, cx
+    cmp     [cs:miss_buf + bp], ax
+    jne     .lm_nxt
+    cmp     [cs:miss_buf + bp + 2], bx
+    je      .lm_done
+.lm_nxt:
+    inc     di
+    jmp     short .lm_chk
+.lm_add:
+    cmp     si, 64
+    jae     .lm_done
+    mov     cx, si
+    shl     cx, 1
+    add     cx, si
+    shl     cx, 1
+    mov     bp, cx
+    mov     [cs:miss_buf + bp], ax
+    mov     [cs:miss_buf + bp + 2], bx
+    mov     [cs:miss_buf + bp + 4], dx
+    inc     word [cs:miss_cnt]
+    push    ds
+    push    dx
+    mov     ax, cs
+    mov     ds, ax
+    mov     dx, fn_misses
+    mov     ah, 3Ch
+    xor     cx, cx
+    int     21h
+    jc      .lm_wr_done
+    mov     bx, ax
+    mov     dx, miss_cnt
+    mov     cx, 386
+    mov     ah, 40h
+    int     21h
+    mov     ah, 3Eh
+    int     21h
+.lm_wr_done:
+    pop     dx
+    pop     ds
+.lm_done:
+    pop     di
+    pop     si
+    pop     cx
+    pop     bx
+    pop     ax
+    popf
+    ret
 global gb_mem_seg, backbuffer_seg, psp_mem_top
 gb_mem_seg:         dw  0
 backbuffer_seg:     dw  0
@@ -574,8 +804,70 @@ old_int09_seg:      dw  0
 old_int08_off:      dw  0
 old_int08_seg:      dw  0
 pit_accum:          dw  0
-global frame_ticks
+global frame_ticks, wdog_ticks, last_ovl_bk, last_ovl_bp, wdog_abort, trace_on, trace_log_call, trace_cnt, trace_ring
 frame_ticks:        dw  0               ; Pending 59.73 Hz frame ticks (INT 08h)
+trace_on:           db  0
+trace_cnt:          dw  0
+trace_ring:         times 64 dd 0       ; 64 x (bank, frame, bp)
+fn_trace:           db  "TRACE.BIN", 0
+trace_log_call:
+    ; Flush trace_cnt + trace_ring cleanly once per frame from helper_halt
+    pushf
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    ds
+.tlc_flush:
+    mov     ax, cs
+    mov     ds, ax
+    mov     dx, fn_trace
+    mov     ah, 3Ch
+    xor     cx, cx
+    int     21h
+    jc      .tlc_done
+    mov     bx, ax
+    mov     dx, trace_cnt
+    mov     cx, 130
+    mov     ah, 40h
+    int     21h
+    mov     ah, 3Eh
+    int     21h
+.tlc_done:
+    pop     ds
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    popf
+    ret
+global last_halt_di
+last_halt_di:       dw  0
+init_sp:            dw  0
+wdog_ticks:         dw  0
+wdog_fired:         db  0
+wdog_ip:            dw  0
+wdog_cs:            dw  0
+wdog_di:            dw  0
+last_ovl_bk:        db  0
+last_ovl_bp:        dw  0
+wdog_abort:
+    mov     ax, cs
+    mov     ss, ax
+    mov     sp, [cs:init_sp]
+    mov     ds, ax
+    mov     word [cs:wdog_ticks], 0
+    mov     ah, 0EEh
+    mov     al, [cs:last_ovl_bk]
+    mov     bx, [cs:wdog_ip]
+    mov     dx, [cs:wdog_cs]
+    call    log_miss
+    mov     ah, 0EFh
+    mov     al, [cs:current_rom_bank]
+    mov     bx, [cs:last_ovl_bp]
+    mov     dx, [cs:wdog_di]
+    call    log_miss
+    jmp     game_clean_exit
 
 global seg_bank0, seg_bank1, seg_bank2, seg_bank3, seg_rom_data
 seg_bank0:          dw  0

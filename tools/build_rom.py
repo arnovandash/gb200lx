@@ -755,13 +755,22 @@ def discover_control_flow(
         trace_b0_worklist(new_b0_tbl)
         bank_labels[0] -= b0_interior
 
+    b0_caller_bks: Dict[int, Set[int]] = {}
+
     def harvest_exact_bank_calls(src_bank: int, vis_set: Set[int], lbl_set: Set[int]):
         """Linearly scan straight-line blocks in vis_set for (bank, addr) pairs before
-        LD (2xxx), A + CALL 0x4000..0x7FFF or CALL/JP/RST far_caller."""
+        LD (2xxx), A + CALL 0x4000..0x7FFF or CALL/JP/RST far_caller or RST inline tables."""
         sorted_v = sorted(vis_set)
+        in_bk = (
+            {k: next(iter(v)) for k, v in b0_caller_bks.items() if len(v) == 1}
+            if src_bank == 0 else {}
+        )
         recent_a = None
         recent_b = None
         recent_hl = None
+        recent_hl_addr = -999
+        recent_a_tbl = None
+        pending_paired_tbl = None
         active_bk = None
         prev_end = -1
         for a in sorted_v:
@@ -769,18 +778,33 @@ def discover_control_flow(
                 recent_a = None
                 recent_b = None
                 recent_hl = None
-                active_bk = None
+                recent_hl_addr = -999
+                recent_a_tbl = None
+                pending_paired_tbl = None
+                active_bk = src_bank if src_bank > 0 else in_bk.get(a)
             ins = disasm.decode_instr(src_bank, a)
             prev_end = a + max(1, ins.length)
             m = ins.mnemonic
             if m.startswith("LD A, 0x"):
                 recent_a = int(m.split(", ")[1], 16)
+                recent_a_tbl = None
             elif m == "XOR A, A":
                 recent_a = 0
+                recent_a_tbl = None
             elif m.startswith("LD B, 0x"):
                 recent_b = int(m.split(", ")[1], 16)
             elif m.startswith("LD HL, 0x"):
                 recent_hl = int(m.split(", ")[1], 16)
+                recent_hl_addr = a
+                recent_a_tbl = None
+            elif m in ("LD A, (HL)", "LDI A, (HL)", "LDD A, (HL)"):
+                recent_a = None
+                if (recent_hl is not None and 0x4000 <= recent_hl < 0x8000
+                        and active_bk is not None and 1 <= active_bk < num_banks
+                        and a - recent_hl_addr <= 10):
+                    recent_a_tbl = (active_bk, recent_hl, a)
+                else:
+                    recent_a_tbl = None
             elif m == "ADD A, A" and (a + 1) in vis_set and recent_hl is not None:
                 nins = disasm.decode_instr(src_bank, a + 1)
                 if nins.mnemonic in ("ADD A, E", "ADD A, L"):
@@ -804,21 +828,97 @@ def discover_control_flow(
                                     bank_labels[0].add(w)
                                 elif 1 <= bk < num_banks:
                                     exact_bn_seeds[bk].add(w)
-            elif m.startswith(("LD (0x2", "LD (0x3")) and m.endswith(", A") and recent_a is not None:
-                active_bk = (recent_a if recent_a != 0 else 1) % num_banks
+            elif m.startswith(("LD (0x2", "LD (0x3")) and m.endswith(", A"):
+                if recent_a is not None:
+                    active_bk = (recent_a if recent_a != 0 else 1) % num_banks
+                    pending_paired_tbl = None
+                elif recent_a_tbl is not None and a - recent_a_tbl[2] <= 6:
+                    pending_paired_tbl = (recent_a_tbl[0], recent_a_tbl[1], a)
+            elif m == "LD (HL), A" and recent_hl is not None and 0x2000 <= recent_hl < 0x4000 and a - recent_hl_addr <= 8:
+                if recent_a is not None:
+                    active_bk = (recent_a if recent_a != 0 else 1) % num_banks
+                    pending_paired_tbl = None
+                elif recent_a_tbl is not None and a - recent_a_tbl[2] <= 6:
+                    pending_paired_tbl = (recent_a_tbl[0], recent_a_tbl[1], a)
+            elif m.startswith("LD (HL), 0x") and recent_hl is not None and 0x2000 <= recent_hl < 0x4000 and a - recent_hl_addr <= 8:
+                imm = int(m.split(", ")[1], 16)
+                active_bk = (imm if imm != 0 else 1) % num_banks
+                pending_paired_tbl = None
             elif (ins.is_call or ins.is_branch or m.startswith("RST ")) and ins.target_addr is not None:
                 t = ins.target_addr
-                if t in bank_setters and recent_a is not None:
-                    active_bk = (recent_a if recent_a != 0 else 1) % num_banks
+                if m.startswith("RST ") and t in rst_table_vecs:
+                    tbl_start = a + 1
+                    limit = 0x4000 if src_bank == 0 else 0x8000
+                    if (pending_paired_tbl is not None
+                            and a - pending_paired_tbl[2] <= 12
+                            and tbl_start + 2 <= limit):
+                        tbl_bk, tbl_ptr, _ = pending_paired_tbl
+                        pending_paired_tbl = None
+                        consec_zero = 0
+                        for i in range(256):
+                            cur = tbl_start + i * 2
+                            if cur + 2 > limit or (i > 0 and (cur in vis_set or (cur + 1) in vis_set)):
+                                break
+                            if tbl_ptr + i >= 0x8000:
+                                break
+                            ebk = disasm.read_u8(tbl_bk, tbl_ptr + i)
+                            w = disasm.read_u16(src_bank, cur)
+                            if ebk >= num_banks:
+                                break
+                            if w == 0:
+                                if 1 <= ebk < num_banks:
+                                    consec_zero = 0
+                                    continue
+                                consec_zero += 1
+                                if consec_zero >= 2:
+                                    break
+                                continue
+                            consec_zero = 0
+                            if w >= 0x8000:
+                                break
+                            if 0x0150 <= w < 0x4000:
+                                jp_hl_targets[0].add(w)
+                                bank_labels[0].add(w)
+                            elif 0x4000 <= w < 0x8000 and 1 <= ebk < num_banks:
+                                exact_bn_seeds[ebk].add(w)
+                            else:
+                                break
+                    elif active_bk is not None and 1 <= active_bk < num_banks:
+                        for i in range(256):
+                            cur = tbl_start + i * 2
+                            if cur + 2 > limit or (i > 0 and (cur in vis_set or (cur + 1) in vis_set)):
+                                break
+                            w = disasm.read_u16(src_bank, cur)
+                            if w < 0x0150 or w >= 0x8000:
+                                break
+                            if w < 0x4000:
+                                if src_bank == 0:
+                                    b0_caller_bks.setdefault(w, set()).add(active_bk)
+                                jp_hl_targets[0].add(w)
+                                bank_labels[0].add(w)
+                            else:
+                                exact_bn_seeds[active_bk].add(w)
+                elif t in bank_setters:
+                    if recent_a is not None:
+                        active_bk = (recent_a if recent_a != 0 else 1) % num_banks
+                        pending_paired_tbl = None
+                    elif recent_a_tbl is not None and a - recent_a_tbl[2] <= 6:
+                        pending_paired_tbl = (recent_a_tbl[0], recent_a_tbl[1], a)
                 elif t in far_callers and recent_hl is not None and 0x4000 <= recent_hl < 0x8000:
                     bk = recent_b if recent_b is not None else recent_a
                     if bk is not None and 1 <= (bk % num_banks) < num_banks:
                         exact_bn_seeds[max(1, bk % num_banks)].add(recent_hl)
                 elif 0x4000 <= t < 0x8000 and active_bk is not None and 1 <= active_bk < num_banks:
                     exact_bn_seeds[active_bk].add(t)
+                elif t < 0x4000:
+                    eff_bk = src_bank if src_bank > 0 else active_bk
+                    if eff_bk is not None and 1 <= eff_bk < num_banks:
+                        b0_caller_bks.setdefault(t, set()).add(eff_bk)
                 if ins.is_unconditional_jump or m in ("RET", "RETI"):
                     active_bk = None
+                    pending_paired_tbl = None
 
+    harvest_exact_bank_calls(0, b0_vis, bank_labels[0])
     harvest_exact_bank_calls(0, b0_vis, bank_labels[0])
 
     # Detect per-bank 0x4000 pointer tables where Bank 0 loads `LD H, 0x40` + `LDI A, (HL)` (e.g. FFA 0x1ED7/1F06/1F35...)
@@ -871,16 +971,12 @@ def discover_control_flow(
                 vec = int(m[4:], 16)
                 b0_refs.add(vec)
                 if vec in rst_table_vecs:
-                    tbl_targets = read_inline_jump_table(disasm, b, a + ins.length)
+                    tbl_start = a + ins.length
+                    tbl_targets = read_inline_jump_table(disasm, b, tbl_start)
                     if not tbl_targets:
                         return None
-                    for t in tbl_targets:
-                        rst_jp_targets.add(t)
-                        if 0x4000 <= t < 0x8000:
-                            labels.add(t)
-                            wl.append(t)
-                        elif 0x0150 <= t < 0x4000 and t not in b0_interior:
-                            b0_refs.add(t)
+                    has_clean_exit = True
+                    tbl_addrs.add((tbl_start, True))
                     continue
                 if vec in rst_1b_arg_vecs:
                     arg_addr = a + ins.length
@@ -912,7 +1008,7 @@ def discover_control_flow(
                 if disasm.read_u8(b, a - 3) == 0xCD and disasm.read_u8(b, a - 6) == 0x21:
                     tbl = disasm.read_u16(b, a - 5)
                     if 0x4000 <= tbl < 0x8000:
-                        tbl_addrs.add(tbl)
+                        tbl_addrs.add((tbl, False))
                 continue
 
             if m in ("RET", "RETI") or m.startswith("RET "):
@@ -927,16 +1023,12 @@ def discover_control_flow(
                             call_table_helpers.add(t)
                     if t in call_table_helpers:
                         b0_refs.add(t)
-                        tbl_targets = read_inline_jump_table(disasm, b, a + ins.length)
+                        tbl_start = a + ins.length
+                        tbl_targets = read_inline_jump_table(disasm, b, tbl_start)
                         if not tbl_targets:
                             return None
-                        for tt in tbl_targets:
-                            rst_jp_targets.add(tt)
-                            if 0x4000 <= tt < 0x8000:
-                                labels.add(tt)
-                                wl.append(tt)
-                            elif 0x0150 <= tt < 0x4000 and tt not in b0_interior:
-                                b0_refs.add(tt)
+                        has_clean_exit = True
+                        tbl_addrs.add((tbl_start, True))
                         continue
                 if t < 0x4000:
                     if t in b0_interior or (0x0100 <= t < 0x0150) or (t < 0x0040 and t not in (0x0000, 0x0008, 0x0010, 0x0018, 0x0020, 0x0028, 0x0030, 0x0038)):
@@ -1003,19 +1095,46 @@ def discover_control_flow(
                         bn_to_b0_set.add(r)
                         bank_labels[0].add(r)
 
-            # Trace validated JP (HL) table entries in Bank b transitively
-            seen_tables: Set[int] = set()
+            # Trace validated JP (HL) and inline RST/call table entries in Bank b transitively
+            seen_tables: Set[Tuple[int, bool]] = set()
             while pending_tables:
-                tbl = min(pending_tables)
-                pending_tables.remove(tbl)
-                if tbl in seen_tables:
+                tbl_item = min(pending_tables)
+                pending_tables.remove(tbl_item)
+                if tbl_item in seen_tables:
                     continue
-                seen_tables.add(tbl)
-                for i in range(64):
-                    w = disasm.read_u16(b, tbl + i * 2)
-                    if not (0x4000 <= w < 0x8000):
+                seen_tables.add(tbl_item)
+                tbl, is_inline = tbl_item
+                max_slots = 256 if is_inline else 64
+                for i in range(max_slots):
+                    slot_addr = tbl + i * 2
+                    if slot_addr + 2 > 0x8000:
                         break
-                    res = trace_bank_subgraph(b, w)
+                    if is_inline and i > 0 and (slot_addr in b_vis or (slot_addr + 1) in b_vis):
+                        break
+                    w = disasm.read_u16(b, slot_addr)
+                    if is_inline:
+                        if not (0x0150 <= w < 0x8000):
+                            break
+                        if w < 0x4000:
+                            if w not in b0_interior:
+                                mins = disasm.decode_instr(0, w).mnemonic
+                                if not (mins.startswith("DB ") or mins in ("STOP", "RST 0x38")):
+                                    bn_to_b0_set.add(w)
+                                    bank_labels[0].add(w)
+                                    jp_hl_targets[b].add(w)
+                            continue
+                    else:
+                        if not (0x4000 <= w < 0x8000):
+                            break
+                    if w in b_interior:
+                        if is_inline:
+                            continue
+                        break
+                    if w in b_vis and not is_inline:
+                        bank_labels[b].add(w)
+                        jp_hl_targets[b].add(w)
+                        continue
+                    res = trace_bank_subgraph(b, w, strict_min_insns=1, speculative=True)
                     if res is not None:
                         vis, interior, labels, b0_refs, more_tbls, rst_jp_targets, _ = res
                         b_vis |= vis
@@ -1027,7 +1146,7 @@ def discover_control_flow(
                         for r in b0_refs:
                             bn_to_b0_set.add(r)
                             bank_labels[0].add(r)
-                    else:
+                    elif not is_inline:
                         break
 
             bank_labels[b] -= b_interior
@@ -1037,7 +1156,10 @@ def discover_control_flow(
             if num_banks > 4:
                 spec_cands = (b0_to_bn_set - resolved_untyped) - exact_cands
                 for t in sorted(spec_cands):
-                    if t in b_interior or t in bank_vis[b] or t in bank_labels[b]:
+                    if t in b_interior or t in bank_labels[b]:
+                        continue
+                    if t in bank_vis[b]:
+                        bank_labels[b].add(t)
                         continue
                     res = trace_bank_subgraph(b, t, strict_min_insns=2, speculative=True)
                     if res is not None:
@@ -1070,6 +1192,7 @@ def discover_control_flow(
             harvest_exact_bank_calls(0, b0_vis, bank_labels[0])
             scan_block_tables(0, b0_vis, bank_labels[0])
 
+        harvest_exact_bank_calls(0, b0_vis, bank_labels[0])
         cur_exact = sum(len(exact_bn_seeds[b]) for b in range(1, num_banks))
         if (len(b0_to_bn_set) == prev_b0_to_bn and len(bn_to_b0_set) == prev_bn_to_b0
                 and len(bank_labels[0]) == prev_b0_labels and cur_exact == prev_exact):
@@ -1306,7 +1429,13 @@ def main():
         b0_helper_lines.append("global rom_bank_seg")
         b0_helper_lines.append("rom_bank_seg:")
         b0_helper_lines.append("    dw 0")
-    b0_entry_off = 4 + len(helper_names) * 4 + (2 if ovl_mode else 0)
+    # Fixed offset 002Eh (ovl_mode) or 0028h (non-ovl_mode): helper_yield_if_ticks
+    b0_helper_lines.append("    call near helper_yield_if_ticks")
+    b0_helper_lines.append("    retf")
+    b0_jp_hl_miss_off = 4 + len(helper_names) * 4 + (2 if ovl_mode else 0) + 4
+    b0_helper_lines.append("    call near helper_jp_hl_miss_abort")
+    b0_helper_lines.append("    retf")
+    b0_entry_off = b0_jp_hl_miss_off + 4
 
     disp_b0_lines = list(b0_helper_lines) + [
         "",
@@ -1371,6 +1500,16 @@ def main():
                 "    popf",
                 "    ret",
                 ".b0_miss:",
+                "    push    ax",
+                "    push    bx",
+                "    push    dx",
+                "    mov     ax, 0200h",
+                "    mov     bx, bp",
+                "    xor     dx, dx",
+                "    call    log_miss",
+                "    pop     dx",
+                "    pop     bx",
+                "    pop     ax",
                 "    pop     si",
                 "    pop     cx",
                 "    pop     bx",
@@ -1424,16 +1563,27 @@ def main():
             "    jae near helper_dispatch_ram_bp",
             "    jmp near ovl_call_bp",
             ".jp_b0_miss:",
+            "    mov     ax, 0300h",
+            "    jmp     near helper_jp_hl_miss_abort",
         ])
     else:
         if 0xFF80 not in jp_hl_targets[0]:
             disp_b0_lines.append("    cmp cx, 0FF80h")
             disp_b0_lines.append(f"    je  near loc_00_{hram_dma_addr:04x}")
+        disp_b0_lines.extend([
+            "    mov     ax, 0300h",
+            "    jmp     near helper_jp_hl_miss_abort",
+        ])
     disp_b0_lines.extend([
-        "    lea di, [di + 2]",
-        "    ret",
+        "",
+        "global helper_jp_hl_miss_abort",
+        "helper_jp_hl_miss_abort:",
+        "    mov     bx, cx",
+        "    mov     dx, [di]",
+        "    call    log_miss",
+        "    jmp     wdog_abort",
+        "",
     ])
-    disp_b0_lines.append("")
 
     if not ovl_mode:
         disp_b0_lines.append("; Dispatchers for Bank 0 calling Banks 1..3")
@@ -1509,8 +1659,16 @@ def main():
                 disp_bn_lines.append(f"    je  near loc_{b:02x}_{t:04x}")
             elif t in bn_to_b0_idx:
                 disp_bn_lines.append(f"    je  near .jp_b0_{t:04x}")
-        disp_bn_lines.append("    lea di, [di + 2]")
-        disp_bn_lines.append("    ret")
+        disp_bn_lines.append(f"    mov ax, 0{0x0300 | b:04X}h")
+        if ovl_mode:
+            disp_bn_lines.append("    mov bp, [cs:0000h]")
+        else:
+            disp_bn_lines.append("    mov bp, cs")
+            disp_bn_lines.append("    sub bp, SEG_PARAS_VAL")
+        disp_bn_lines.append("    push bp")
+        disp_bn_lines.append(f"    push word {b0_jp_hl_miss_off}")
+        disp_bn_lines.append("    mov bp, sp")
+        disp_bn_lines.append("    call far [bp]")
         for t in sorted(jp_hl_targets[b]):
             if t < 0x4000 and t in bn_to_b0_idx:
                 disp_bn_lines.append(f".jp_b0_{t:04x}:")
@@ -1754,6 +1912,24 @@ def main():
                     lines.append(f"{lbl_done}:")
                     curr = next_c
                     continue
+
+            # Generic frame_ticks >= 2 back-edge yield for polling loops without HALT
+            # (e.g. Pokemon Blue HandleMenuInput_ 00:3AD9..00:3AFF & 01:5BBA..01:5BCF)
+            if (instr.target_addr is not None
+                    and (instr.is_branch or instr.is_unconditional_jump)
+                    and instr.mnemonic != "JP (HL)"
+                    and 0 < curr - instr.target_addr <= 64):
+                t_lp = instr.target_addr
+                p_lp = t_lp
+                has_halt = False
+                while p_lp < curr:
+                    ins_lp = disasm.decode_instr(b, p_lp)
+                    if ins_lp.mnemonic in ("HALT", "STOP") or ins_lp.mnemonic.startswith("DB "):
+                        has_halt = True
+                        break
+                    p_lp += max(1, ins_lp.length)
+                if p_lp == curr and not has_halt:
+                    lines.append("    call helper_yield_if_ticks")
 
             # Route cross-bank and RAM CALL / JP
             if (instr.is_call or instr.is_branch) and instr.target_addr is not None:
