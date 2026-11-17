@@ -63,6 +63,16 @@ In [codegen_80186/recompiler_80186.py](codegen_80186/recompiler_80186.py):
   2. **Banks 1–3 (`seg1..seg3`):** Each bank is assembled with `org 0`, starting with a `dispatch_bN` jump table (4 bytes per entry).
   3. **Pass 1 / Pass 2:** Pass 1 measures exact segment paragraph sizes (`SEG1_PARAS_VAL`, `SEG2_PARAS_VAL`, `SEG3_PARAS_VAL`, `SEG_ROM_PARAS_VAL`), then Pass 2 re-assembles with exact segment deltas and packs `build/GAME.BIN` -> `build/GAME.EXE` via [tools/mzpack.py](tools/mzpack.py).
 
+### 4.1 Overlay Mode (> 64 KiB / > 4 Banks)
+
+When a ROM has more than 4 banks, `build_rom.py` defines `OVL_MODE` and emits `GAME.EXE` + `GAME.OVL`:
+- **Segment 0 (`GAME.EXE`):** Runtime, recompiled Bank 0, `overlay.asm`, and the overlay directory (`ovl_dir`). Only reachable basic blocks are emitted to keep Segment 0 under 64 KiB.
+- **`GAME.OVL`:** Holds one `org 0` recompiled code segment per switchable bank (each with a sorted entry-point table that `ovl_call_bp` binary-searches) plus the raw 16 KiB ROM banks used for data reads.
+- **Code cache:** `ovl_call_bp` maps a `(current_rom_bank, target)` pair to a code slot (`ovl_ensure_code_bank`, LRU), binary-searches the bank's entry table, pins the slot during the far call, and unpins it on return. Calls from bank code back into Bank 0 go through `call_bank0_XXXX` bridges, and indirect jumps go through `helper_dispatch_any_bp` / `helper_dispatch_ram_bp`.
+- **Data cache:** `helper_write_mbc` decodes MBC1 (5+2-bit with mode select), MBC2 (4-bit, A8 select) and MBC3 (7-bit). `ovl_load_rom_data` then pages the selected raw bank into `0x4000..0x7FFF` from an LRU of 16 KiB data slots. `ovl_switch_sram_bank` swaps 8 KiB cartridge RAM banks into `0xA000..0xBFFF`.
+- **Control-flow discovery for banked code:** Cross-bank entries are typed via `LD (2xxx), A; CALL 4xxx` bank-setter idioms and far-call trampolines. Also covered: packed 1-byte inline-arg `RST` bank/address tables, inline 8-word pointer tables, Bank 0 table-jump helpers (`CALL tbl; JP (HL)`), and mixed Bank 0/N pointer tables. Discovery runs in two passes: exact seeds first, then a speculative pass that rejects targets overlapping known code.
+- **Synthetic return pushes:** `LD rr, imm16; PUSH rr` is lowered to an x86 call frame that checks the GB stack pointer on return. If the callee popped the pushed address (an unwinding exit), the x86 frame is unwound too. Otherwise execution jumps to `imm16` without leaking x86 stack.
+
 ---
 
 ## 5. Memory Map & Runtime Routing
@@ -73,7 +83,7 @@ In [codegen_80186/recompiler_80186.py](codegen_80186/recompiler_80186.py):
 
 ```
 0x0000 - 0x3FFF : ROM Bank 00
-0x4000 - 0x7FFF : Switchable ROM Bank 01..03 (updated via helper_write_mbc)
+0x4000 - 0x7FFF : Switchable ROM Bank (copied or paged from GAME.OVL via helper_write_mbc)
 0x8000 - 0x97FF : VRAM Tile Data (writes through helpers flag tile_dirty[0..383])
 0x9800 - 0x9FFF : VRAM Tile Maps
 0xA000 - 0xFDFF : External RAM / WRAM / Echo RAM

@@ -414,6 +414,8 @@ class CodeGenerator80186:
                 return ["push ax", f"mov al, {xsrc}"] + self._write_hl(addr) + ["pop ax"]
             # LD r, (HL)
             if src == "(HL)":
+                if dst == "A":
+                    return ["call helper_read_hl"]
                 xdst = REG8_TO_X86.get(dst, 'al')
                 return ["mov si, cx", f"mov {xdst}, [si]"]
 
@@ -469,6 +471,8 @@ class CodeGenerator80186:
                     return ["call helper_read_joyp"]
                 elif target == 0xFF04:
                     return ["call helper_read_div"]
+                elif target == 0xFF41:
+                    return ["call helper_read_stat"]
                 elif target == 0xFF44:
                     return ["call helper_read_ly"]
                 else:
@@ -495,6 +499,8 @@ class CodeGenerator80186:
                 return ["call helper_read_joyp"]
             elif n_val == 0x04:
                 return ["call helper_read_div"]
+            elif n_val == 0x41:
+                return ["call helper_read_stat"]
             elif n_val == 0x44:
                 return ["call helper_read_ly"]
             else:
@@ -520,11 +526,11 @@ class CodeGenerator80186:
         if m == "LDI (HL), A":
             return ["mov si, cx", "lea cx, [si + 1]"] + self._indirect_write(addr, "si", ["mov [si], al"], "helper_write_hl")
         if m == "LDI A, (HL)":
-            return ["mov si, cx", "mov al, [si]", "lea cx, [si + 1]"]
+            return ["call helper_read_hl", "lea cx, [si + 1]"]
         if m == "LDD (HL), A":
             return ["mov si, cx", "lea cx, [si - 1]"] + self._indirect_write(addr, "si", ["mov [si], al"], "helper_write_hl")
         if m == "LDD A, (HL)":
-            return ["mov si, cx", "mov al, [si]", "lea cx, [si - 1]"]
+            return ["call helper_read_hl", "lea cx, [si - 1]"]
 
         # 3. ALU 8-bit
         alu_ops = {

@@ -35,7 +35,7 @@ def pack_mz(input_bin: str, output_exe: str, min_extra: int = 0x1000, max_extra:
     stack_paras = 0x0800  # 32 KiB
     actual_min_extra = max(min_extra, gb_ram_paras + stack_paras)
 
-    ss = image_paras + gb_ram_paras
+    ss = image_paras + actual_min_extra - stack_paras
     sp = stack_paras * 16 # 0x8000 (32 KiB)
     ip = 0
     cs = 0

@@ -7,6 +7,16 @@
 bits 16
 cpu 186
 
+%ifndef SRAM_PARAS_VAL
+    %define SRAM_PARAS_VAL 0
+%endif
+%ifndef ROM_BANK_MASK_VAL
+    %define ROM_BANK_MASK_VAL 03h
+%endif
+%ifndef MAPPER_TYPE_VAL
+    %define MAPPER_TYPE_VAL 1
+%endif
+
 ; ------------------------------------------------------------------------------
 ; PUSH AF: Pack x86 flags into SM83 format in AH, push AF onto GB stack [di]
 ; Game Boy F: [Z(7) N(6) H(5) C(4) 0 0 0 0]
@@ -235,10 +245,17 @@ helper_read_c:
     je      short .rc_joyp
     cmp     bx, 0FF04h
     je      short .rc_div
+    cmp     bx, 0FF41h
+    je      short .rc_stat
     cmp     bx, 0FF44h
     je      short .rc_ly
     mov     al, [bx]
     pop     bx
+    popf
+    ret
+.rc_stat:
+    pop     bx
+    call    helper_read_stat
     popf
     ret
 .rc_joyp:
@@ -256,6 +273,46 @@ helper_read_c:
     call    helper_read_ly
     popf
     ret
+
+; ------------------------------------------------------------------------------
+; helper_read_hl: Read byte at [CX] into AL, routing 0xFF00/FF04/FF41/FF44 MMIO.
+; Fast path when CH != 0xFF. Preserves CX, SI, and CPU flags!
+; ------------------------------------------------------------------------------
+global helper_read_hl
+helper_read_hl:
+    mov     si, cx
+    lahf
+    cmp     ch, 0FFh
+    je      short .rhl_ff
+    sahf
+    mov     al, [si]
+    ret
+.rhl_ff:
+    sahf
+    pushf
+    cmp     cl, 00h
+    je      short .rhl_joyp
+    cmp     cl, 04h
+    je      short .rhl_div
+    cmp     cl, 41h
+    je      short .rhl_stat
+    cmp     cl, 44h
+    je      short .rhl_ly
+    mov     al, [si]
+    popf
+    ret
+.rhl_joyp:
+    popf
+    jmp     near helper_read_joyp
+.rhl_div:
+    popf
+    jmp     near helper_read_div
+.rhl_stat:
+    popf
+    jmp     near helper_read_stat
+.rhl_ly:
+    popf
+    jmp     near helper_read_ly
 
 ; ------------------------------------------------------------------------------
 ; helper_dma_transfer: OAM DMA transfer from AL*0x100 to 0xFE00..0xFE9F
@@ -304,11 +361,11 @@ global helper_write_mbc
 helper_write_mbc:
     pushf
     cmp     bp, 02000h
-    jb      short .mbc_done
+    jb      near .mbc_done
     cmp     bp, 04000h
-    jae     short .mbc_done
+    jae     short .chk_upper_mbc
 
-    ; Bank select
+    ; --- 0x2000..0x3FFF: ROM Bank Select (Low 5 bits for MBC1, 4 bits+A8 for MBC2, 7 bits for MBC3) ---
     push    ax
     push    bx
     push    cx
@@ -318,31 +375,61 @@ helper_write_mbc:
     push    ds
     push    es
 
-    and     al, 1Fh             ; MBC1 5-bit bank select
+    mov     bl, [cs:mapper_type]
+    cmp     bl, 2                   ; MAPPER_MBC2: bit 8 (0100h) must be set to select ROM bank
+    jne     short .not_mbc2
+    test    bp, 0100h
+    jz      near .bank_already_active
+    and     al, 0Fh
+    jmp     short .fix_zero_bank
+
+.not_mbc2:
+    cmp     bl, 3                   ; MAPPER_MBC3 / MBC5: 7-bit bank register
+    jae     short .mbc3_select
+
+    ; MAPPER_MBC1: bits 4..0 = low 5 bits; 0 -> 1 BEFORE combining upper 2 bits (6..5)
+    and     al, 1Fh
+    jnz     short .mbc1_nz
+    mov     al, 01h
+.mbc1_nz:
+    cmp     byte [cs:mbc1_mode], 0
+    jne     short .apply_mask
+    mov     ah, [cs:mbc1_hi_bank]
+    shl     ah, 5
+    or      al, ah
+    jmp     short .apply_mask
+
+.mbc3_select:
+    and     al, 7Fh
+.fix_zero_bank:
+    jnz     short .apply_mask
+    mov     al, 01h
+.apply_mask:
     and     al, [cs:rom_bank_mask]
     jnz     short .not_zero
-    mov     al, 01h             ; Bank 0 maps to bank 1 in 0x4000..0x7FFF
+    mov     al, 01h                 ; Bank 0 maps to bank 1 in 0x4000..0x7FFF
 .not_zero:
     cmp     al, [cs:current_rom_bank]
     je      short .bank_already_active
 
     mov     [cs:current_rom_bank], al
 
+%ifndef OVL_MODE
     ; Copy 16 KiB (8192 words) from seg_rom_data:al*0x4000 to DS:[0x4000]
-    mov     es, [cs:gb_mem_seg] ; ES = Game Boy memory segment
-    mov     di, 04000h          ; Destination = 0x4000 in GB RAM
-
-    ; Calculate source address in seg_rom_data
+    mov     es, [cs:gb_mem_seg]
+    mov     di, 04000h
     xor     ah, ah
     mov     dx, 4000h
-    mul     dx                  ; DX:AX = AL * 4000h
+    mul     dx
     mov     si, ax
     mov     ax, [cs:seg_rom_data]
-    mov     ds, ax              ; DS = seg_rom_data (source of ROM data)
-
-    mov     cx, 8192            ; 8192 words = 16,384 bytes
+    mov     ds, ax
+    mov     cx, 8192
     cld
     rep     movsw
+%else
+    call    ovl_load_rom_data
+%endif
 
 .bank_already_active:
     pop     es
@@ -353,8 +440,74 @@ helper_write_mbc:
     pop     cx
     pop     bx
     pop     ax
-
 .mbc_done:
+    popf
+    ret
+
+.chk_upper_mbc:
+    cmp     bp, 06000h
+    jae     short .chk_mbc1_mode
+    ; --- 0x4000..0x5FFF: Upper ROM bank / External RAM bank select ---
+    cmp     byte [cs:mapper_type], 1
+    jne     short .chk_mbc3_ram
+    push    ax
+    and     al, 03h
+    mov     [cs:mbc1_hi_bank], al
+%if SRAM_PARAS_VAL > 0
+    cmp     byte [cs:mbc1_mode], 1
+    jne     short .mbc1_hi_done
+    and     al, [cs:sram_bank_mask]
+    push    bx
+    push    cx
+    push    si
+    push    di
+    push    ds
+    push    es
+    call    ovl_switch_sram_bank
+    pop     es
+    pop     ds
+    pop     di
+    pop     si
+    pop     cx
+    pop     bx
+%endif
+.mbc1_hi_done:
+    pop     ax
+    popf
+    ret
+
+.chk_mbc3_ram:
+%if SRAM_PARAS_VAL > 0
+    cmp     byte [cs:mapper_type], 3
+    jne     short .mbc_done
+    cmp     al, [cs:sram_bank_mask]
+    ja      short .mbc_done
+    push    ax
+    push    bx
+    push    cx
+    push    si
+    push    di
+    push    ds
+    push    es
+    call    ovl_switch_sram_bank
+    pop     es
+    pop     ds
+    pop     di
+    pop     si
+    pop     cx
+    pop     bx
+    pop     ax
+%endif
+    popf
+    ret
+
+.chk_mbc1_mode:
+    cmp     byte [cs:mapper_type], 1
+    jne     short .mbc_done
+    push    ax
+    and     al, 01h
+    mov     [cs:mbc1_mode], al
+    pop     ax
     popf
     ret
 
@@ -460,6 +613,32 @@ helper_read_ly:
     mov     byte [cs:emulated_ly], 0
 .ly_ok:
     mov     al, [cs:emulated_ly]
+    popf
+    ret
+
+; ------------------------------------------------------------------------------
+; helper_read_stat: Read LCDC status register [0xFF41]
+; Cycles mode bits 1..0 through [2, 3, 0, 1] so STAT polling loops (OAM/VRAM/
+; HBlank/VBlank waits) never spin indefinitely, sets bit 2 on LY==LYC, and
+; preserves bits 7..3 of [ds:0FF41h] plus all CPU flags.
+; ------------------------------------------------------------------------------
+global helper_read_stat
+helper_read_stat:
+    pushf
+    push    bx
+    mov     bl, [cs:stat_phase]
+    inc     byte [cs:stat_phase]
+    and     bx, 03h
+    mov     al, [cs:stat_mode_lut + bx]
+    mov     bl, [cs:emulated_ly]
+    cmp     bl, [ds:0FF45h]
+    jne     short .stat_no_lyc
+    or      al, 04h
+.stat_no_lyc:
+    mov     bl, [ds:0FF41h]
+    and     bl, 0F8h
+    or      al, bl
+    pop     bx
     popf
     ret
 
@@ -575,6 +754,12 @@ helper_halt:
     ; Set VBlank IF flag (bit 0)
     or      byte [ds:0FF0Fh], 01h
 
+    ; Enter VBlank at scanline 144 so VBlank ISRs checking LY see >= 144
+    cmp     byte [cs:emulated_ly], 144
+    jae     short .ly_vblank_ok
+    mov     byte [cs:emulated_ly], 144
+.ly_vblank_ok:
+
     ; Check if Game Boy interrupts are enabled (IME == 1)
     cmp     byte [cs:gb_ime], 0
     je      .done
@@ -621,6 +806,8 @@ helper_halt:
     call    near loc_00_0050
 
 .done:
+    ; Reset LY to active frame start (0) when returning from VBlank frame tick
+    mov     byte [cs:emulated_ly], 0
     call    apu_frame_tick
     popf
     ret
@@ -638,10 +825,13 @@ helper_mark_tile_dirty:
 %include "runtime/sound_spk.asm"
 %include "runtime/savestate.asm"
 %include "runtime/pause_menu.asm"
+%ifdef OVL_MODE
+%include "runtime/overlay.asm"
+%endif
 
 %else
 ; ==============================================================================
-; SEGMENTS 1..3 (BANKS 1..3) FAR-CALL BRIDGES TO SEGMENT 0
+; SEGMENTS 1..N (BANKS 1..N) FAR-CALL BRIDGES TO SEGMENT 0
 ; Segment 0 fixed helper jump table offsets:
 ;   0004h: helper_write_mbc
 ;   0008h: helper_write_mmio
@@ -650,127 +840,52 @@ helper_mark_tile_dirty:
 ;   0014h: helper_read_ly
 ;   0018h: helper_update_bgp
 ;   001Ch: helper_halt
+;   0020h: helper_mark_tile_dirty
+;   0024h: helper_read_stat
+;   0028h: helper_dispatch_any_bp (OVL_MODE)
 ; ==============================================================================
-
-global helper_write_mbc
-helper_write_mbc:
+%macro SEG0_BRIDGE 2
+global %1
+%1:
     pushf
     push    bx
+%ifdef OVL_MODE
+    mov     bx, [cs:0000h]
+%else
     mov     bx, cs
     sub     bx, SEG_PARAS_VAL
+%endif
     push    bx
-    push    word 0004h
+    push    word %2
     mov     bx, sp
     call    far [ss:bx]
     add     sp, 4
     pop     bx
     popf
     ret
+%endmacro
 
-global helper_write_mmio
-helper_write_mmio:
-    pushf
-    push    bx
-    mov     bx, cs
-    sub     bx, SEG_PARAS_VAL
-    push    bx
-    push    word 0008h
-    mov     bx, sp
-    call    far [ss:bx]
-    add     sp, 4
-    pop     bx
-    popf
-    ret
+SEG0_BRIDGE helper_write_mbc, 0004h
+SEG0_BRIDGE helper_write_mmio, 0008h
+SEG0_BRIDGE helper_read_joyp, 000Ch
+SEG0_BRIDGE helper_read_div, 0010h
+SEG0_BRIDGE helper_read_ly, 0014h
+SEG0_BRIDGE helper_update_bgp, 0018h
+SEG0_BRIDGE helper_halt, 001Ch
+SEG0_BRIDGE helper_mark_tile_dirty, 0020h
+SEG0_BRIDGE helper_read_stat, 0024h
 
-global helper_read_joyp
-helper_read_joyp:
-    pushf
-    push    bx
-    mov     bx, cs
-    sub     bx, SEG_PARAS_VAL
-    push    bx
-    push    word 000Ch
-    mov     bx, sp
-    call    far [ss:bx]
-    add     sp, 4
-    pop     bx
-    popf
+%ifdef OVL_MODE
+global helper_dispatch_any_bp
+helper_dispatch_any_bp:
+    push    word [cs:0000h]
+    push    word 0028h
+    mov     si, sp
+    call    far [ss:si]
+    pop     si
+    pop     si
     ret
-
-global helper_read_div
-helper_read_div:
-    pushf
-    push    bx
-    mov     bx, cs
-    sub     bx, SEG_PARAS_VAL
-    push    bx
-    push    word 0010h
-    mov     bx, sp
-    call    far [ss:bx]
-    add     sp, 4
-    pop     bx
-    popf
-    ret
-
-global helper_read_ly
-helper_read_ly:
-    pushf
-    push    bx
-    mov     bx, cs
-    sub     bx, SEG_PARAS_VAL
-    push    bx
-    push    word 0014h
-    mov     bx, sp
-    call    far [ss:bx]
-    add     sp, 4
-    pop     bx
-    popf
-    ret
-
-global helper_update_bgp
-helper_update_bgp:
-    pushf
-    push    bx
-    mov     bx, cs
-    sub     bx, SEG_PARAS_VAL
-    push    bx
-    push    word 0018h
-    mov     bx, sp
-    call    far [ss:bx]
-    add     sp, 4
-    pop     bx
-    popf
-    ret
-
-global helper_halt
-helper_halt:
-    pushf
-    push    bx
-    mov     bx, cs
-    sub     bx, SEG_PARAS_VAL
-    push    bx
-    push    word 001Ch
-    mov     bx, sp
-    call    far [ss:bx]
-    add     sp, 4
-    pop     bx
-    popf
-    ret
-
-global helper_mark_tile_dirty
-helper_mark_tile_dirty:
-    pushf
-    push    bx
-    mov     bx, cs
-    sub     bx, SEG_PARAS_VAL
-    push    bx
-    push    word 0020h
-    mov     bx, sp
-    call    far [ss:bx]
-    add     sp, 4
-    pop     bx
-    popf
-    ret
+%endif
 
 %endif
 
@@ -786,9 +901,15 @@ helper_stop:
 ; ------------------------------------------------------------------------------
 global gb_ime, current_rom_bank, rom_bank_mask, emulated_ly
 gb_ime:             db  0       ; Game Boy Interrupt Master Enable (0=off, 1=on)
-current_rom_bank:   db  1       ; Currently selected 16 KiB ROM bank (1..3)
-rom_bank_mask:      db  03h     ; ROM bank bitmask (default 03h for 4 banks)
+current_rom_bank:   db  1       ; Currently selected 16 KiB ROM bank (1..N-1)
+rom_bank_mask:      db  ROM_BANK_MASK_VAL ; ROM bank bitmask
+mapper_type:        db  MAPPER_TYPE_VAL   ; 0=None, 1=MBC1, 2=MBC2, 3=MBC3
+sram_bank_mask:     db  03h     ; SRAM 8 KiB bank mask (for >8 KiB SRAM)
+mbc1_hi_bank:       db  0       ; MBC1 upper 2-bit bank / SRAM bank register
+mbc1_mode:          db  0       ; MBC1 0=ROM banking mode, 1=RAM banking mode
 emulated_ly:        db  148     ; Current emulated scanline (default 148 = 0x94 VBlank)
+stat_phase:         db  0       ; STAT polling phase (0..3)
+stat_mode_lut:      db  2, 3, 0, 1 ; Mode cycle: OAM(2)->VRAM(3)->HBlank(0)->VBlank(1)
 div_counter:        db  0       ; DIV register counter
 skip_run:           db  0       ; Consecutive frames whose render was skipped
 MAX_FRAME_SKIP      equ 3       ; Render at least every 4th frame (>= 15 fps)

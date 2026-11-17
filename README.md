@@ -21,13 +21,21 @@
 
 ## Current Status & Compatibility
 
-- **Supported ROMs:** Unmodified 32 KiB (ROM-only) and 64 KiB (MBC1, up to 4 × 16 KiB banks) DMG `.gb` ROMs statically mapped into 16-bit code segments.
+- **Supported ROMs:**
+  - **≤ 64 KiB** (ROM-only / MBC1, up to 4 × 16 KiB banks): a single standalone `GAME.EXE` with all banks statically mapped into 16-bit code segments.
+  - **> 64 KiB** (MBC1, MBC2, MBC3 with banked SRAM): `GAME.EXE` + a `GAME.OVL` overlay archive. Recompiled bank code and raw ROM data are paged from disk into LRU caches on demand (*experimental*).
 - **Verified Playable Titles:**
   - *Super Mario Land (World) (Rev 1)* — full gameplay including `STAT`/`LYC` split-scroll HUD, 1-pixel `SCX` scrolling, sprites, pipes (OAM BG priority), and BCD timer.
   - *Tetris - Rosy Retrospection (v1.2)* — Window/BG rendering and gameplay.
   - *Bubble Ghost (USA, Europe)* — sprites, Window HUD, and full-speed gameplay.
+- **Banked (> 64 KiB) Titles Booting in Headless Tests:**
+  - *The Legend of Zelda: Link's Awakening* (MBC1, 512 KiB) — storm/sailboat intro.
+  - *Pokémon Blue* (MBC3, 1 MiB, 32 KiB SRAM) — copyright, Game Freak logo, and intro.
+  - *Final Fantasy Adventure* (MBC2, 256 KiB) — title and `New Game / Continue` menu (text overlaps the title logo; known rendering issue).
+  - *Final Fantasy Legend III* (MBC1, 256 KiB) — title screen, waiting for input.
 - **Current Limitations:**
-  - ROMs larger than 64 KiB (e.g., 1 MiB MBC3 titles) are not yet supported (would require disk-paged bank overlays and SRAM persistence).
+  - Banked (> 64 KiB) support is new. Headless runs reach title/intro screens; full gameplay has not yet been verified. Cartridge SRAM is emulated in memory but not yet saved to disk.
+  - MBC5 and Game Boy Color (`.gbc`) ROMs are not supported.
   - Audio maps Game Boy Channels 1, 2 (square + sweep/envelope/length) and Channel 3 (wave fallback) to the single-voice HP 200LX PC speaker (Channel 4 noise is omitted).
 
 ---
@@ -45,6 +53,7 @@ Interpreting a 4.19 MHz Sharp SM83 CPU instruction-by-instruction on a 7.91 MHz 
 - **PC Speaker Sound Synthesis:** Synthesizes Game Boy APU Channels 1 & 2 (with length counters, envelopes, and Ch1 frequency sweep) plus Channel 3 wave fallback via PIT channel 2 (`0x42`/`0x61`).
 - **Save States & In-Game Pause Menu:** Quick-save (`F5`) and quick-load (`F9`) to `GBSTATE0.SAV`, plus an `ESC` pause overlay (`Resume Game`, `Save State`, `Load State`, live `Options` editor saving to `GB200LX.INI`, and `Quit`).
 - **Relocation-Free Segmentation:** Multi-bank ROMs (up to 64 KiB / 4 banks) are split into contiguous 16-bit code segments with precomputed far-call dispatchers, requiring no EMS or protected-mode extenders.
+- **Dynamic Bank Overlays (> 64 KiB):** Each switchable bank is recompiled into its own relocatable code segment inside `GAME.OVL`. At runtime, `overlay.asm` keeps an LRU cache of code slots (pinned while executing) and 16 KiB raw ROM data slots, using plain DOS file I/O (no EMS/XMS required).
 
 ---
 
@@ -173,7 +182,7 @@ make setup
 > [!TIP]
 > If `<rom_stem>.sym` or `<rom_stem>.cdl` sits alongside your `.gb` file, `tools/build_rom.py` automatically loads it for additional indirect jump/call entry seeds.
 
-Copy `build/GAME.EXE` (and optionally `GB200LX.INI`) to your HP 200LX CF card or RAM disk and run it under MS-DOS.
+Copy `build/GAME.EXE` (plus `build/GAME.OVL` for ROMs larger than 64 KiB, and optionally `GB200LX.INI`) to your HP 200LX CF/SD card and run it under MS-DOS. `GAME.OVL` must sit in the current directory.
 
 ---
 
@@ -193,6 +202,7 @@ gb200lx/
 │   ├── sound_spk.asm       # PIT Channel 2 PC speaker APU synthesizer (Ch1/Ch2/Ch3)
 │   ├── savestate.asm       # Quick Save/Load (F5/F9 -> GBSTATE0.SAV)
 │   ├── pause_menu.asm      # ESC pause overlay menu & live GB200LX.INI options editor
+│   ├── overlay.asm         # GAME.OVL bank paging: LRU code/data caches & SRAM banks
 │   └── recomp_helpers.asm  # Bank switching, DMA, MMIO, HALT pacing & far bridges
 ├── tools/                  # Build orchestration & MS-DOS packaging
 │   ├── build_rom.py        # Multi-segment CFG analyzer, 2-pass builder & .sym/.cdl loader
@@ -214,7 +224,7 @@ gb200lx/
 
 - [x] **Save States & Pause Menu:** Snapshot/restore 64 KiB Game Boy RAM, active hardware stack, timer/PPU, and APU state to `GBSTATE0.SAV` (`F5`/`F9` or via the `ESC` pause menu with live `GB200LX.INI` options).
 - [ ] **AdLib / OPL2 Sound Support:** Optional multi-channel FM synthesis driver (`0x388`/`0x389`) for DOS PCs and emulators alongside the HP 200LX PC speaker driver.
-- [ ] **Dynamic Bank Switching (> 64 KiB ROMs):** Disk-paged or EMS-backed code/data overlays for larger MBC1/MBC3/MBC5 titles (e.g., 1 MiB+ games).
+- [x] **Dynamic Bank Switching (> 64 KiB ROMs):** Disk-paged `GAME.OVL` code/data overlays for MBC1/MBC2/MBC3 titles (experimental; MBC5 pending).
 - [ ] **Battery-Backed SRAM Saving:** Persist external cartridge RAM (`0xA000–0xBFFF`, plus MBC3 RTC where applicable) to `.SAV` files for games like *Pokémon*.
 
 ---

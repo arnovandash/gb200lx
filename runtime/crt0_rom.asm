@@ -14,6 +14,8 @@ cpu 186
     %define SEG1_PARAS_VAL 01111h
     %define SEG2_PARAS_VAL 02222h
     %define SEG3_PARAS_VAL 03333h
+%endif
+%ifndef SEG_ROM_PARAS_VAL
     %define SEG_ROM_PARAS_VAL 04444h
 %endif
 
@@ -58,10 +60,11 @@ entry:
     int     21h
 
 .cfg_ok:
-    ; 2. Calculate segment bases for Bank 0, 1, 2, 3 and ROM data
+    ; 2. Calculate segment bases
     mov     ax, cs
     mov     [seg_bank0], ax
 
+%ifndef OVL_MODE
     mov     cx, ax
     add     cx, SEG1_PARAS_VAL
     mov     [seg_bank1], cx
@@ -79,21 +82,25 @@ entry:
     mov     [seg_rom_data], cx
 
     ; 3. Allocate 64 KiB Game Boy memory segment directly above entire image
-    ; Entire binary ends at seg_rom_data + 1000h paragraphs (64 KiB of ROM data)
     mov     ax, [seg_rom_data]
     add     ax, 1000h               ; ax = paragraph base of 64 KiB Game Boy memory block
+%else
+    ; Overlay mode: 64 KiB GB memory starts right above seg0 (at CS + SEG_ROM_PARAS_VAL)
+    add     ax, SEG_ROM_PARAS_VAL
+%endif
     mov     [gb_mem_seg], ax        ; Save 64 KiB Game Boy memory segment
     add     ax, 1000h               ; ax = paragraph base of 8 KiB CGA backbuffer segment
     mov     [backbuffer_seg], ax
 
     ; 4. Zero-initialize the 64 KiB Game Boy memory block
-    mov     es, ax
+    mov     es, [gb_mem_seg]
     xor     di, di
     xor     ax, ax
     mov     cx, 32768               ; 32768 words = 65,536 bytes
     cld
     rep     stosw
 
+%ifndef OVL_MODE
     ; 5. Copy Bank 0 (16 KiB) from ROM data into DS:[0x0000..0x3FFF]
     mov     ax, [seg_rom_data]
     mov     ds, ax
@@ -108,6 +115,10 @@ entry:
     mov     di, 4000h               ; ES:DI = GB RAM 0x4000
     mov     cx, 8192
     rep     movsw
+%else
+    ; Open GAME.OVL, allocate code/data cache slots, and load Bank 0 + Bank 1
+    call    ovl_init
+%endif
 
     ; Restore DS to CS
     mov     ax, cs
@@ -235,6 +246,10 @@ game_clean_exit:
 
     ; Restore PIT to 18.2 Hz and original INT 08h vector
     call    unhook_int08
+
+%ifdef OVL_MODE
+    call    ovl_close
+%endif
 
     ; Print exit message and return to DOS
     mov     ax, cs

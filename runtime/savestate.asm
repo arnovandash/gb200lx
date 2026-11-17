@@ -49,8 +49,8 @@ savestate_save:
     mov     ds, ax
     mov     es, ax
 
-    ; Copy ROM header checksum (seg_rom_data:014Eh) to guard cross-ROM loads
-    mov     es, [seg_rom_data]
+    ; Copy ROM header checksum (gb_mem_seg:014Eh) to guard cross-ROM loads
+    mov     es, [gb_mem_seg]
     mov     ax, [es:014Eh]
     mov     [state_hdr_romchk], ax
 
@@ -190,7 +190,7 @@ savestate_open_valid:
     repe    cmpsb
     jne     short .ov_close_fail
 
-    mov     es, [seg_rom_data]
+    mov     es, [gb_mem_seg]
     mov     ax, [es:014Eh]
     cmp     ax, [state_hdr_romchk]
     jne     short .ov_close_fail
@@ -284,6 +284,7 @@ savestate_load:
 
     mov     ax, [state_hdr_cs]
     mov     [reloc_old_segs + 0], ax
+%ifndef OVL_MODE
     mov     cx, ax
     add     cx, SEG1_PARAS_VAL
     mov     [reloc_old_segs + 2], cx
@@ -298,6 +299,15 @@ savestate_load:
     mov     [reloc_old_segs + 8], ax
     add     ax, 1000h               ; old backbuffer_seg
     mov     [reloc_old_segs + 10], ax
+%else
+    add     ax, SEG_ROM_PARAS_VAL   ; old gb_mem_seg
+    mov     [reloc_old_segs + 2], ax
+    add     ax, 1000h               ; old backbuffer_seg
+    mov     [reloc_old_segs + 4], ax
+    mov     [reloc_old_segs + 6], ax
+    mov     [reloc_old_segs + 8], ax
+    mov     [reloc_old_segs + 10], ax
+%endif
 
     mov     si, state_stack_buf
     mov     cx, [state_hdr_sslen]
