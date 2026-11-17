@@ -28,9 +28,9 @@
   - *Super Mario Land (World) (Rev 1)* — full gameplay including `STAT`/`LYC` split-scroll HUD, 1-pixel `SCX` scrolling, sprites, pipes (OAM BG priority), and BCD timer.
   - *Tetris - Rosy Retrospection (v1.2)* — Window/BG rendering and gameplay.
   - *Bubble Ghost (USA, Europe)* — sprites, Window HUD, and full-speed gameplay.
-- **Banked (> 64 KiB) Titles Booting in Headless Tests:**
-  - *The Legend of Zelda: Link's Awakening* (MBC1, 512 KiB) — storm/sailboat intro.
-  - *Pokémon Blue* (MBC3, 1 MiB, 32 KiB SRAM) — copyright, Game Freak logo, and intro.
+- **Banked (> 64 KiB) Titles:**
+  - *The Legend of Zelda: Link's Awakening* (MBC1, 512 KiB) — intro, file select, and in-game (`cycles=fixed 7910` runs at 60 FPS with dynamic cache sizing and zero-copy ROM bank reads).
+  - *Pokémon Blue* (MBC3, 1 MiB, 32 KiB SRAM) — copyright, Game Freak/Nidorino vs Gengar intro, and animated Start screen.
   - *Final Fantasy Adventure* (MBC2, 256 KiB) — title and `New Game / Continue` menu (text overlaps the title logo; known rendering issue).
   - *Final Fantasy Legend III* (MBC1, 256 KiB) — title screen, waiting for input.
 - **Current Limitations:**

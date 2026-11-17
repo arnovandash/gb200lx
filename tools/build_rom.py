@@ -1188,6 +1188,58 @@ def main():
     bn_to_b0 = sorted(t for t in bn_to_b0_set if t in bank_labels[0])
     bn_to_b0_idx = {t: i for i, t in enumerate(bn_to_b0)}
 
+    def can_unwind_func(bk: int, start: int) -> bool:
+        """Return True if a subroutine can POP caller stack frames (SP net > 0) without LD SP, HL."""
+        lo = 0 if bk == 0 else 0x4000
+        hi = 0x4000 if bk == 0 else 0x8000
+        seen: Dict[int, int] = {}
+        stk = [(start, 0)]
+        steps = 0
+        while stk and steps < 250:
+            addr, bal = stk.pop()
+            steps += 1
+            if addr in seen and seen[addr] >= bal:
+                continue
+            seen[addr] = bal
+            if not (lo <= addr < hi):
+                continue
+            ins = disasm.decode_instr(bk, addr)
+            m = ins.mnemonic
+            if m.startswith("DB ") or m in ("RET", "RETI", "LD SP, HL"):
+                continue
+            if m.startswith("PUSH "):
+                bal -= 2
+            elif m.startswith("POP "):
+                bal += 2
+                if bal > 0:
+                    return True
+            elif ins.is_unconditional_jump:
+                if ins.target_addr is not None:
+                    stk.append((ins.target_addr, bal))
+                continue
+            elif ins.is_branch and ins.target_addr is not None:
+                stk.append((ins.target_addr, bal))
+            stk.append((addr + ins.length, bal))
+        return False
+
+    call_targets_seen: Set[Tuple[int, int]] = set()
+    for b in range(num_banks):
+        for a in bank_vis[b]:
+            ins = disasm.decode_instr(b, a)
+            if ins.is_call and ins.target_addr is not None and ins.target_addr < 0x8000:
+                t_bk = 0 if ins.target_addr < 0x4000 else b
+                call_targets_seen.add((t_bk, ins.target_addr))
+    unwinding_funcs: Set[Tuple[int, int]] = {
+        (tb, ta) for (tb, ta) in call_targets_seen if can_unwind_func(tb, ta)
+    }
+
+    def emit_di_guard(out_lines: List[str], tag: str, unwind_jcc: str, cont_insn: Optional[str]) -> None:
+        """Emit compact post-call DI stack-unwind check preserving AX, BP, and FLAGS."""
+        helper = "helper_di_chk_ne" if unwind_jcc == "jne" else "helper_di_chk_gt"
+        out_lines.append(f"    call near {helper}")
+        if cont_insn:
+            out_lines.append(f"    {cont_insn}")
+
     # Detect `PUSH rr; ...; RET/RETI` computed jumps across reachable blocks in each bank
     push_ret_addrs: Dict[int, Set[int]] = {b: set() for b in range(num_banks)}
     for b in range(num_banks):
@@ -1249,7 +1301,12 @@ def main():
     for hname in helper_names:
         b0_helper_lines.append(f"    call near {hname}")
         b0_helper_lines.append("    retf")
-    b0_entry_off = 4 + len(helper_names) * 4
+    if ovl_mode:
+        # Fixed offset 002Ch (= 4 + 10*4): segment base of active 0x4000..0x7FFF ROM data bank (-0x0400 paras)
+        b0_helper_lines.append("global rom_bank_seg")
+        b0_helper_lines.append("rom_bank_seg:")
+        b0_helper_lines.append("    dw 0")
+    b0_entry_off = 4 + len(helper_names) * 4 + (2 if ovl_mode else 0)
 
     disp_b0_lines = list(b0_helper_lines) + [
         "",
@@ -1487,7 +1544,7 @@ def main():
     for b in range(num_banks):
         start_addr = 0x0000 if b == 0 else 0x4000
         end_addr = 0x4000 if b == 0 else 0x8000
-        cg = CodeGenerator80186(disasm)
+        cg = CodeGenerator80186(disasm, ovl_mode=ovl_mode)
 
         for l_addr in bank_labels[b]:
             cg.labels.add((b, l_addr))
@@ -1583,43 +1640,12 @@ def main():
                 if next_ins.mnemonic == f"PUSH {rr}" and imm in lbl_set:
                     xreg = {"BC": "bx", "DE": "dx", "HL": "cx"}[rr]
                     lbl_cont = f".push_ret_{curr:04x}"
-                    lbl_loop = f".push_loop_{curr:04x}"
                     lines.append(f"    mov {xreg}, 0{imm:04X}h")
                     lines.append("    lea di, [di - 2]")
                     lines.append(f"    mov [di], {xreg}")
                     lines.append("    push di")
                     lines.append(f"    call near {lbl_cont}")
-                    lines.append("    pushf")
-                    lines.append("    push ax")
-                    lines.append("    push bp")
-                    lines.append("    mov bp, sp")
-                    lines.append("    mov ax, [bp+6]")
-                    lines.append("    add ax, 2")
-                    lines.append("    cmp di, ax")
-                    lines.append(f"    je {lbl_loop}")
-                    lines.append("    mov ax, [bp+4]")
-                    lines.append("    mov [bp+6], ax")
-                    lines.append("    mov ax, [bp+2]")
-                    lines.append("    mov [bp+4], ax")
-                    lines.append("    mov ax, [bp+0]")
-                    lines.append("    mov [bp+2], ax")
-                    lines.append("    add sp, 2")
-                    lines.append("    pop bp")
-                    lines.append("    pop ax")
-                    lines.append("    popf")
-                    lines.append("    ret")
-                    lines.append(f"{lbl_loop}:")
-                    lines.append("    mov ax, [bp+4]")
-                    lines.append("    mov [bp+6], ax")
-                    lines.append("    mov ax, [bp+2]")
-                    lines.append("    mov [bp+4], ax")
-                    lines.append("    mov ax, [bp+0]")
-                    lines.append("    mov [bp+2], ax")
-                    lines.append("    add sp, 2")
-                    lines.append("    pop bp")
-                    lines.append("    pop ax")
-                    lines.append("    popf")
-                    lines.append(f"    jmp near {cg.label_name(b, imm)}")
+                    emit_di_guard(lines, f"pr_{curr:04x}", "jne", f"jmp near {cg.label_name(b, imm)}")
                     lines.append(f"{lbl_cont}:")
                     if ovl_mode:
                         # Skip PUSH rr inside emit_addrs since we consumed both instructions
@@ -1636,10 +1662,18 @@ def main():
                 lines.append("    mov dh, 000h")
                 lines.append("    add cx, dx")
                 lines.append("    mov si, cx")
-                lines.append("    mov dl, [si]")
-                lines.append("    inc cx")
-                lines.append("    mov si, cx")
-                lines.append("    mov dh, [si]")
+                if ovl_mode and next_c >= 0x4000:
+                    lines.append("    mov es, [cs:0000h]")
+                    lines.append("    mov es, [es:002Ch]")
+                    lines.append("    mov dl, [es:si]")
+                    lines.append("    inc cx")
+                    lines.append("    mov si, cx")
+                    lines.append("    mov dh, [es:si]")
+                else:
+                    lines.append("    mov dl, [si]")
+                    lines.append("    inc cx")
+                    lines.append("    mov si, cx")
+                    lines.append("    mov dh, [si]")
                 lines.append("    mov cx, dx")
                 lines.append("    mov si, cx")
                 lines.append("    jmp near helper_dispatch_jp_hl")
@@ -1647,16 +1681,74 @@ def main():
                 continue
 
             # Generic interrupt-driven spin-loop yield
-            if instr.mnemonic.startswith("JR Z, ") and instr.target_addr is not None and curr - 4 <= instr.target_addr <= curr - 3:
+            if instr.mnemonic.startswith(("JR Z, ", "JR NZ, ")) and instr.target_addr is not None and 0 < curr - instr.target_addr <= 24:
                 t_spin = instr.target_addr
-                i0 = disasm.decode_instr(b, t_spin)
-                i1 = disasm.decode_instr(b, t_spin + i0.length)
-                if (t_spin + i0.length + i1.length == curr
-                        and (i0.mnemonic.startswith("LDH A, (0x") or i0.mnemonic.startswith("LD A, (0xC") or i0.mnemonic.startswith("LD A, (0xD"))
-                        and i1.mnemonic in ("AND A, A", "OR A, A")):
+                is_spin = False
+                if instr.mnemonic.startswith("JR Z, ") and curr - 4 <= t_spin <= curr - 3:
+                    i0 = disasm.decode_instr(b, t_spin)
+                    i1 = disasm.decode_instr(b, t_spin + i0.length)
+                    if (t_spin + i0.length + i1.length == curr
+                            and (i0.mnemonic.startswith("LDH A, (0x") or i0.mnemonic.startswith("LD A, (0xC") or i0.mnemonic.startswith("LD A, (0xD"))
+                            and i1.mnemonic in ("AND A, A", "OR A, A")):
+                        is_spin = True
+                if not is_spin:
+                    # Pure WRAM/HRAM polling loop (no stores, calls, counters, or MMIO reads)
+                    p_sp = t_spin
+                    body_insns = []
+                    while p_sp < curr:
+                        ins_sp = disasm.decode_instr(b, p_sp)
+                        body_insns.append(ins_sp)
+                        p_sp += max(1, ins_sp.length)
+                    if p_sp == curr and body_insns:
+                        hl_fixed = False
+                        has_ram_rd = False
+                        ok_sp = True
+                        for ins_sp in body_insns:
+                            ms = ins_sp.mnemonic
+                            if ins_sp.is_call or ins_sp.is_branch or ms.startswith(("PUSH ", "POP ", "RST ", "DEC ", "INC B", "INC C", "INC D", "INC E")):
+                                ok_sp = False
+                                break
+                            if ms.startswith("LD HL, 0x"):
+                                imm_hl = int(ms.split(", ")[1], 16)
+                                if not (0xC000 <= imm_hl < 0xFE00 or 0xFF80 <= imm_hl <= 0xFFFE):
+                                    ok_sp = False
+                                    break
+                                hl_fixed = True
+                            elif ms in ("INC HL", "DEC HL"):
+                                if not hl_fixed:
+                                    ok_sp = False
+                                    break
+                            elif ms in ("XOR A, A", "AND A, A", "OR A, A") or ms.startswith(("CP A, 0x", "BIT ")):
+                                if "(HL)" in ms:
+                                    if not hl_fixed:
+                                        ok_sp = False
+                                        break
+                                    has_ram_rd = True
+                            elif ms in ("OR A, (HL)", "AND A, (HL)", "LD A, (HL)"):
+                                if not hl_fixed:
+                                    ok_sp = False
+                                    break
+                                has_ram_rd = True
+                            elif ms.startswith("LDH A, (0x"):
+                                if int(ms.split("(0x")[1].split(")")[0], 16) < 0x80:
+                                    ok_sp = False
+                                    break
+                                has_ram_rd = True
+                            elif ms.startswith("LD A, (0x"):
+                                a_rd = int(ms.split("(0x")[1].split(")")[0], 16)
+                                if not (0xC000 <= a_rd < 0xFE00 or 0xFF80 <= a_rd <= 0xFFFE):
+                                    ok_sp = False
+                                    break
+                                has_ram_rd = True
+                            else:
+                                ok_sp = False
+                                break
+                        is_spin = ok_sp and has_ram_rd
+                if is_spin:
                     cg.labels.add((b, t_spin))
                     lbl_done = f".spin_exit_{curr:04x}"
-                    lines.append(f"    jnz short {lbl_done}")
+                    neg_spin = "jnz" if instr.mnemonic.startswith("JR Z, ") else "jz"
+                    lines.append(f"    {neg_spin} short {lbl_done}")
                     lines.append("    call helper_halt")
                     lines.append(f"    jmp near {cg.label_name(b, t_spin)}")
                     lines.append(f"{lbl_done}:")
@@ -1706,19 +1798,30 @@ def main():
                     neg_jcc = {"Z": "jnz", "NZ": "jz", "C": "jnc", "NC": "jc"}.get(cond, "jmp")
 
                     if instr.is_call:
+                        t_bk = 0 if t < 0x4000 else b
+                        use_guard = (t_bk, t) in unwinding_funcs
                         if is_cond:
                             lbl_skip = f".skip_cc_{curr:04x}"
-                            lines.append(f"    {neg_jcc} short {lbl_skip}")
+                            jmp_sz = "near" if use_guard else "short"
+                            lines.append(f"    {neg_jcc} {jmp_sz} {lbl_skip}")
                             lines.append("    lea di, [di - 2]")
                             lines.append(f"    mov word [di], {next_addr}")
+                            if use_guard:
+                                lines.append("    push di")
                             for cl in cross_call_lines:
                                 lines.append(f"    {cl}")
+                            if use_guard:
+                                emit_di_guard(lines, f"uw_{curr:04x}", "ja", None)
                             lines.append(f"{lbl_skip}:")
                         else:
                             lines.append("    lea di, [di - 2]")
                             lines.append(f"    mov word [di], {next_addr}")
+                            if use_guard:
+                                lines.append("    push di")
                             for cl in cross_call_lines:
                                 lines.append(f"    {cl}")
+                            if use_guard:
+                                emit_di_guard(lines, f"uw_{curr:04x}", "ja", None)
                     else:
                         if is_cond:
                             lbl_skip = f".skip_cj_{curr:04x}"
@@ -1731,6 +1834,26 @@ def main():
                             for cl in cross_call_lines:
                                 lines.append(f"    {cl}")
                             lines.append("    ret")
+                    curr = next_c
+                    continue
+
+                if instr.is_call and (0 if t < 0x4000 else b, t) in unwinding_funcs:
+                    t_bk = 0 if t < 0x4000 else b
+                    cg.labels.add((t_bk, t))
+                    parts = m.split(None, 1)[1].split(", ")
+                    is_cond = len(parts) > 1
+                    cond = parts[0] if is_cond else None
+                    neg_jcc = {"Z": "jnz", "NZ": "jz", "C": "jnc", "NC": "jc"}.get(cond, "jmp")
+                    lbl_skip = f".skip_cuw_{curr:04x}"
+                    if is_cond:
+                        lines.append(f"    {neg_jcc} near {lbl_skip}")
+                    lines.append("    lea di, [di - 2]")
+                    lines.append(f"    mov word [di], {next_addr}")
+                    lines.append("    push di")
+                    lines.append(f"    call near {cg.label_name(b, t)}")
+                    emit_di_guard(lines, f"uw_{curr:04x}", "ja", None)
+                    if is_cond:
+                        lines.append(f"{lbl_skip}:")
                     curr = next_c
                     continue
 
@@ -1930,7 +2053,8 @@ org 0
             seg_bins[b] = data_b
 
         max_code_bytes = max(len(d) for d in seg_bins.values())
-        code_slot_paras = max_code_bytes // 16
+        max_code_paras = max_code_bytes // 16
+        total_code_paras = sum(len(d) // 16 for d in seg_bins.values())
 
         # Build GAME.OVL = raw ROM bytes + packed switchable code banks 1..N-1
         ovl_path = f"{BUILD_DIR}/GAME.OVL"
@@ -1951,15 +2075,6 @@ org 0
         with open(f"{OUT_DIR}/ovl_dir.asm", "w") as f:
             f.write("\n".join(ovl_dir_lines) + "\n")
 
-        # Size code/data cache slots cleanly within HP 200LX ~576 KiB conventional RAM budget
-        # Budget: seg0 (~4096 paras) + gb_ram (0x1200) + sram + stack (0x0800) + caches <= ~0x9000 (576 KiB)
-        fixed_after_seg0 = 0x1200 + sram_paras + 0x0800
-        avail_cache_paras = max(code_slot_paras * 3, 0x9000 - 0x1000 - fixed_after_seg0)
-        # Keep >= 2 data slots (32 KiB) and fit 3..6 code slots first
-        num_code_slots = max(3, min(6, (avail_cache_paras - 0x0800) // max(1, code_slot_paras)))
-        rem_paras = max(0x0400, avail_cache_paras - num_code_slots * code_slot_paras)
-        num_data_slots = max(1, min(8, rem_paras // 0x0400))
-
         def write_seg0_ovl(seg_rom_p: int):
             seg0_ovl = f"""
 bits 16
@@ -1973,9 +2088,8 @@ org 0
 %define MAPPER_TYPE_VAL {mapper_type}
 %define SRAM_PARAS_VAL 0{sram_paras:04X}h
 %define SRAM_BANK_MASK_VAL 0{sram_bank_mask:02X}h
-%define CODE_SLOT_PARAS 0{code_slot_paras:04X}h
-%define NUM_CODE_SLOTS {num_code_slots}
-%define NUM_DATA_SLOTS {num_data_slots}
+%define MAX_CODE_PARAS 0{max_code_paras:04X}h
+%define TOTAL_CODE_PARAS 0{min(0xFFFF, total_code_paras):04X}h
 %define SEG_ROM_PARAS_VAL 0{seg_rom_p:04X}h
 
 entry_trampoline:
@@ -2011,11 +2125,12 @@ image_end:
         with open(f"{OUT_DIR}/seg0.bin", "rb") as f:
             seg0_pad = pad16(f.read())
 
-        min_extra = 0x1200 + sram_paras + (num_code_slots * code_slot_paras) + (num_data_slots * 0x0400) + 0x0800
-        total_kb = (len(seg0_pad) + min_extra * 16) // 1024
+        # Minimum DOS headroom: 64 KiB GB RAM + 8 KiB backbuffer + 32 KiB stack = 0x1A00 paras;
+        # ovl_init dynamically claims all remaining conventional DOS RAM up to psp_mem_top.
+        min_extra = 0x1A00
+        min_cache_kb = (total_code_paras * 16) // 1024
         print(f"[gb200lx] Overlay Layout: seg0={len(seg0_pad)}B, max_bank={max_code_bytes}B, "
-              f"code_cache={num_code_slots}x{code_slot_paras*16//1024}KiB, "
-              f"data_cache={num_data_slots}x16KiB, sram={sram_paras*16//1024}KiB, total_dos_ram~{total_kb}KiB")
+              f"total_code={min_cache_kb}KiB, sram={sram_paras*16//1024}KiB (dynamic cache up to PSP top)")
         print(f"[gb200lx] Overlay archive: {ovl_path} ({cur_off} bytes)")
 
         with open(bin_path, "wb") as f:

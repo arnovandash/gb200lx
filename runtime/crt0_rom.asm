@@ -29,6 +29,8 @@ entry:
     ;   DS, ES = PSP segment
     mov     ax, cs
     mov     ds, ax                  ; DS = program segment (ES preserved as PSP!)
+    mov     ax, [es:0002h]          ; Save PSP top-of-DOS-memory segment
+    mov     [psp_mem_top], ax
 
     ; Check PSP command line (ES:80h) BEFORE any calls that might clobber ES
     mov     cl, [es:80h]            ; command line length
@@ -555,9 +557,10 @@ print_dos_string:
 ; Variables & Constants
 ; ------------------------------------------------------------------------------
 fn_vram_dump:       db  "CGA_VRAM.BIN", 0
-global gb_mem_seg, backbuffer_seg
+global gb_mem_seg, backbuffer_seg, psp_mem_top
 gb_mem_seg:         dw  0
 backbuffer_seg:     dw  0
+psp_mem_top:        dw  0
 
 global exit_requested, menu_requested, menu_active
 exit_requested:     db  0

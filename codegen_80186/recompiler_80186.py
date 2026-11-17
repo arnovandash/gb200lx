@@ -324,8 +324,9 @@ class SM83Disassembler:
 
 
 class CodeGenerator80186:
-    def __init__(self, disasm: SM83Disassembler):
+    def __init__(self, disasm: SM83Disassembler, ovl_mode: bool = False):
         self.disasm = disasm
+        self.ovl_mode = ovl_mode
         self.labels: Set[Tuple[int, int]] = set()
         self.last_alu_sub: bool = False
         # Set by the caller before each translate_instruction():
@@ -417,6 +418,8 @@ class CodeGenerator80186:
                 if dst == "A":
                     return ["call helper_read_hl"]
                 xdst = REG8_TO_X86.get(dst, 'al')
+                if self.ovl_mode:
+                    return ["call helper_es_hl", f"mov {xdst}, [es:si]"]
                 return ["mov si, cx", f"mov {xdst}, [si]"]
 
             # LD r, r'
@@ -475,6 +478,10 @@ class CodeGenerator80186:
                     return ["call helper_read_stat"]
                 elif target == 0xFF44:
                     return ["call helper_read_ly"]
+                elif self.ovl_mode and 0x4000 <= target < 0x8000:
+                    if bank == 0:
+                        return ["mov es, [cs:rom_bank_seg]", f"mov al, [es:0{target:04X}h]"]
+                    return ["mov es, [cs:0000h]", "mov es, [es:002Ch]", f"mov al, [es:0{target:04X}h]"]
                 else:
                     return [f"mov al, [0{target:04X}h]"]
 
@@ -516,11 +523,11 @@ class CodeGenerator80186:
         if m == "LD (BC), A":
             return self._indirect_write(addr, "bx", ["mov [bx], al"], "helper_write_bc")
         if m == "LD A, (BC)":
-            return ["mov al, [bx]"]
+            return ["call helper_read_bc"] if self.ovl_mode else ["mov al, [bx]"]
         if m == "LD (DE), A":
             return self._indirect_write(addr, "dx", ["mov si, dx", "mov [si], al"], "helper_write_de")
         if m == "LD A, (DE)":
-            return ["mov bp, dx", "mov al, [ds:bp]"]
+            return ["call helper_read_de"] if self.ovl_mode else ["mov bp, dx", "mov al, [ds:bp]"]
 
         # LDI / LDD
         if m == "LDI (HL), A":
@@ -549,6 +556,8 @@ class CodeGenerator80186:
                 if src in REG8_TO_X86:
                     return [f"{x86_alu} al, {REG8_TO_X86[src]}"]
                 elif src == "(HL)":
+                    if self.ovl_mode:
+                        return ["call helper_es_hl", f"{x86_alu} al, [es:si]"]
                     return ["mov si, cx", f"{x86_alu} al, [si]"]
                 elif src.startswith("0x"):
                     imm = src.replace("0x", "0") + "h"
@@ -640,6 +649,8 @@ class CodeGenerator80186:
             if r in REG8_TO_X86:
                 return ["lahf", f"test {REG8_TO_X86[r]}, {mask}", "rcr ah, 1"]
             elif r == "(HL)":
+                if self.ovl_mode:
+                    return ["call helper_es_hl", "lahf", f"test byte [es:si], {mask}", "rcr ah, 1"]
                 return ["mov si, cx", "lahf", f"test byte [si], {mask}", "rcr ah, 1"]
 
         if m.startswith("SET "):

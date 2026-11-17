@@ -81,6 +81,58 @@ helper_pop_af:
     ret
 
 ; ------------------------------------------------------------------------------
+; helper_di_chk_gt / helper_di_chk_ne: Compact stack-unwind check after CALL.
+; Entry stack: [guard_ret, saved_di, caller_ret].
+; If DI unwound beyond saved_di+2, drops guard_ret+saved_di and returns to caller_ret;
+; otherwise drops saved_di and returns to guard_ret. Preserves AX, BP, FLAGS.
+; ------------------------------------------------------------------------------
+global helper_di_chk_gt, helper_di_chk_ne
+helper_di_chk_gt:
+    pushf
+    push    ax
+    push    bp
+    mov     bp, sp
+    mov     ax, [bp + 8]
+    add     ax, 2
+    cmp     di, ax
+    ja      short di_unwind_frame
+di_keep_frame:
+    mov     ax, [bp + 6]
+    mov     [bp + 8], ax
+    mov     ax, [bp + 4]
+    mov     [bp + 6], ax
+    mov     ax, [bp + 2]
+    mov     [bp + 4], ax
+    mov     ax, [bp + 0]
+    mov     [bp + 2], ax
+    add     sp, 2
+    pop     bp
+    pop     ax
+    popf
+    ret
+helper_di_chk_ne:
+    pushf
+    push    ax
+    push    bp
+    mov     bp, sp
+    mov     ax, [bp + 8]
+    add     ax, 2
+    cmp     di, ax
+    je      short di_keep_frame
+di_unwind_frame:
+    mov     ax, [bp + 4]
+    mov     [bp + 8], ax
+    mov     ax, [bp + 2]
+    mov     [bp + 6], ax
+    mov     ax, [bp + 0]
+    mov     [bp + 4], ax
+    add     sp, 4
+    pop     bp
+    pop     ax
+    popf
+    ret
+
+; ------------------------------------------------------------------------------
 ; helper_write_hl: Range check for indirect write to [si]
 ; SI = target address, AL = byte to write. Preserves all CPU flags!
 ; ------------------------------------------------------------------------------
@@ -274,16 +326,39 @@ helper_read_c:
     popf
     ret
 
+%ifdef OVL_MODE
+%macro LOAD_ROM_BANK_ES 0
+%ifdef SEG_IS_BANK0
+    mov     es, [cs:rom_bank_seg]
+%else
+    mov     es, [cs:0000h]
+    mov     es, [es:002Ch]
+%endif
+%endmacro
+%endif
+
 ; ------------------------------------------------------------------------------
-; helper_read_hl: Read byte at [CX] into AL, routing 0xFF00/FF04/FF41/FF44 MMIO.
-; Fast path when CH != 0xFF. Preserves CX, SI, and CPU flags!
+; helper_read_hl: Read byte at [CX] into AL, routing 0x4000..0x7FFF ROM bank (OVL)
+; and 0xFF00/FF04/FF41/FF44 MMIO. Fast path for RAM. Preserves CX, SI, FLAGS!
 ; ------------------------------------------------------------------------------
 global helper_read_hl
 helper_read_hl:
     mov     si, cx
     lahf
+%ifdef OVL_MODE
+    cmp     ch, 080h
+    jae     short .rhl_chk_ff
+    cmp     ch, 040h
+    jb      short .rhl_ds
+    LOAD_ROM_BANK_ES
+    sahf
+    mov     al, [es:si]
+    ret
+.rhl_chk_ff:
+%endif
     cmp     ch, 0FFh
     je      short .rhl_ff
+.rhl_ds:
     sahf
     mov     al, [si]
     ret
@@ -314,6 +389,66 @@ helper_read_hl:
     popf
     jmp     near helper_read_ly
 
+%ifdef OVL_MODE
+; ------------------------------------------------------------------------------
+; helper_es_hl: Point ES:SI to GB address CX (rom_bank_seg if 0x4000..0x7FFF,
+; otherwise DS). Preserves AX, BX, CX, DX, DI, BP, and CPU FLAGS!
+; ------------------------------------------------------------------------------
+global helper_es_hl
+helper_es_hl:
+    mov     si, cx
+    lahf
+    cmp     ch, 080h
+    jae     short .ehl_ds
+    cmp     ch, 040h
+    jb      short .ehl_ds
+    LOAD_ROM_BANK_ES
+    sahf
+    ret
+.ehl_ds:
+    push    ds
+    pop     es
+    sahf
+    ret
+
+; ------------------------------------------------------------------------------
+; helper_read_bc / helper_read_de: Read [BX] or [DX] into AL, routing
+; 0x4000..0x7FFF through rom_bank_seg. Preserves all GP regs (except AL) & FLAGS!
+; ------------------------------------------------------------------------------
+global helper_read_bc
+helper_read_bc:
+    lahf
+    cmp     bh, 080h
+    jae     short .rbc_ds
+    cmp     bh, 040h
+    jb      short .rbc_ds
+    LOAD_ROM_BANK_ES
+    sahf
+    mov     al, [es:bx]
+    ret
+.rbc_ds:
+    sahf
+    mov     al, [bx]
+    ret
+
+global helper_read_de
+helper_read_de:
+    mov     bp, dx
+    lahf
+    cmp     dh, 080h
+    jae     short .rde_ds
+    cmp     dh, 040h
+    jb      short .rde_ds
+    LOAD_ROM_BANK_ES
+    sahf
+    mov     al, [es:bp]
+    ret
+.rde_ds:
+    sahf
+    mov     al, [ds:bp]
+    ret
+%endif
+
 ; ------------------------------------------------------------------------------
 ; helper_dma_transfer: OAM DMA transfer from AL*0x100 to 0xFE00..0xFE9F
 ; Copies 160 bytes (80 words) within Game Boy memory. Preserves all flags & regs!
@@ -326,6 +461,7 @@ helper_dma_transfer:
     push    si
     push    di
     push    es
+    push    ds
 
     ; Source = AL * 0x100
     mov     ah, al
@@ -333,13 +469,28 @@ helper_dma_transfer:
     mov     si, ax
 
     mov     ax, ds
-    mov     es, ax              ; ES = DS = Game Boy memory segment
+    mov     es, ax              ; ES = Game Boy memory segment
+%ifdef OVL_MODE
+    cmp     si, 04000h
+    jb      short .dma_ds_ok
+    cmp     si, 08000h
+    jae     short .dma_ds_ok
+%ifdef SEG_IS_BANK0
+    mov     ds, [cs:rom_bank_seg]
+%else
+    mov     ax, [cs:0000h]
+    mov     ds, ax
+    mov     ds, [ds:002Ch]
+%endif
+.dma_ds_ok:
+%endif
     mov     di, 0FE00h          ; Destination = OAM
 
     mov     cx, 80              ; 80 words = 160 bytes
     cld
     rep     movsw
 
+    pop     ds
     pop     es
     pop     di
     pop     si
